@@ -1,5 +1,10 @@
 //! Application state and UI.
 
+mod games_ui;
+mod review_ui;
+
+pub use review_ui::{ReviewState, class_color};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,12 +12,15 @@ use std::time::{Duration, Instant};
 
 use chess_engine::cache::CacheStats;
 use chess_engine::notation::line_to_san;
+use chess_engine::pgn::{PgnGame, utc_now};
 use chess_engine::search::mate_in;
 use chess_engine::{Color, Game, Move, Piece, PieceType, SearchInfo, SearchResult, Square, default_threads};
 use egui::{Color32, Key, RichText, Ui, vec2};
 
 use crate::board::{self, BoardState, BoardView, PROMOTION_CHOICES};
+use crate::library::{GameLibrary, SavedGame};
 use crate::pieces::PieceImages;
+use crate::review_worker::ReviewHandle;
 use crate::worker::{EngineConfig, EngineHandle, Purpose, Request, Response, SearchJob};
 
 pub const MAX_DEPTH: u32 = 40;
@@ -34,6 +42,14 @@ impl Mode {
     }
 }
 
+/// Top-level screens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Play,
+    Games,
+    Review,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SidePick {
     White,
@@ -52,6 +68,10 @@ pub struct AppConfig {
     pub fen: Option<String>,
     /// Minimum time before a bot move is shown (so instant replies don't feel abrupt).
     pub bot_delay: Duration,
+    /// Folder where every game is saved as PGN (`None` = don't save).
+    pub games_dir: Option<PathBuf>,
+    /// Search depth for Game Review.
+    pub review_depth: u32,
 }
 
 impl Default for AppConfig {
@@ -65,6 +85,8 @@ impl Default for AppConfig {
             side: SidePick::White,
             fen: None,
             bot_delay: Duration::from_millis(350),
+            games_dir: None,
+            review_depth: 14,
         }
     }
 }
@@ -119,6 +141,19 @@ pub struct ChessApp {
     cache_path: Option<PathBuf>,
     saved_this_game: bool,
     bot_moves: u64,
+
+    pub tab: Tab,
+    pub review: Option<ReviewState>,
+    pub review_depth: u32,
+    reviewer: ReviewHandle,
+    library: Option<GameLibrary>,
+    /// File the current game is being saved to (created on its first move).
+    pub record: Option<PathBuf>,
+    record_tags: Vec<(String, String)>,
+    pub games: Vec<SavedGame>,
+    games_dirty: bool,
+    confirm_delete: Option<PathBuf>,
+    pgn_input: String,
 }
 
 fn white_relative(score: i32, side: Color) -> i32 {
@@ -127,6 +162,7 @@ fn white_relative(score: i32, side: Color) -> i32 {
 
 pub fn format_score(white_score: i32) -> String {
     match mate_in(white_score) {
+        Some(0) => "mate".into(), // the game ended in checkmate
         Some(n) if n > 0 => format!("#{n}"),
         Some(n) => format!("#-{}", -n),
         None => format!("{:+.2}", white_score as f64 / 100.0),
@@ -138,7 +174,7 @@ pub fn with_commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -176,6 +212,8 @@ impl ChessApp {
             EngineConfig { hash_mb: cfg.hash_mb, threads: cfg.threads, cache_path: cfg.cache_path.clone() },
             move || wake_ctx.request_repaint(),
         );
+        let wake_ctx = ctx.clone();
+        let reviewer = ReviewHandle::spawn(256.min(cfg.hash_mb.max(16)), move || wake_ctx.request_repaint());
         let mut app = ChessApp {
             game: Game::new(),
             depth: cfg.depth.clamp(1, MAX_DEPTH),
@@ -205,6 +243,17 @@ impl ChessApp {
             cache_path: cfg.cache_path,
             saved_this_game: false,
             bot_moves: 0,
+            tab: Tab::Play,
+            review: None,
+            review_depth: cfg.review_depth.clamp(1, MAX_DEPTH),
+            reviewer,
+            library: cfg.games_dir.map(GameLibrary::new),
+            record: None,
+            record_tags: Vec::new(),
+            games: Vec::new(),
+            games_dirty: true,
+            confirm_delete: None,
+            pgn_input: String::new(),
         };
         app.new_game();
         if let Some(fen) = cfg.fen
@@ -367,12 +416,13 @@ impl ChessApp {
     /// Advance the game state machine: start bot searches, play bot moves.
     pub fn tick(&mut self) {
         self.poll_engine();
-        if let Some((m, ready)) = self.pending_bot_move {
-            if Instant::now() >= ready {
-                self.pending_bot_move = None;
-                self.play_move(m);
-                self.bot_moves += 1;
-            }
+        self.poll_review();
+        if let Some((m, ready)) = self.pending_bot_move
+            && Instant::now() >= ready
+        {
+            self.pending_bot_move = None;
+            self.play_move(m);
+            self.bot_moves += 1;
         }
         let side = self.game.side_to_move();
         let wants_bot = self.is_bot(side)
@@ -398,6 +448,7 @@ impl ChessApp {
             self.board.selected = None;
             self.view_ply = None;
             self.message = None;
+            self.autosave();
         }
     }
 
@@ -447,6 +498,7 @@ impl ChessApp {
             }
         }
         self.saved_this_game = false;
+        self.autosave();
     }
 
     pub fn resign(&mut self) {
@@ -454,6 +506,7 @@ impl ChessApp {
             self.cancel_job();
             let side = if self.mode == Mode::HumanVsBot { self.human } else { self.game.side_to_move() };
             self.game.resign(side);
+            self.autosave();
         }
     }
 
@@ -483,6 +536,71 @@ impl ChessApp {
         self.last_search = None;
         self.paused = false;
         self.saved_this_game = false;
+        self.start_record();
+    }
+
+    // ------------------------------------------------------------ saved games
+
+    /// Player names for the PGN tags of the current mode.
+    fn player_names(&self) -> (String, String) {
+        let bot = "chess-rs".to_string();
+        let human = "Human".to_string();
+        match self.mode {
+            Mode::HumanVsBot if self.human == Color::White => (human, bot),
+            Mode::HumanVsBot => (bot, human),
+            Mode::BotVsBot => (bot.clone(), bot),
+            Mode::HumanVsHuman => (human.clone(), human),
+        }
+    }
+
+    /// Begin a new game record: timestamp and players are fixed at the start.
+    fn start_record(&mut self) {
+        self.record = None;
+        let (date, time) = utc_now();
+        let (white, black) = self.player_names();
+        self.record_tags = vec![
+            ("Event".into(), "chess-rs game".into()),
+            ("Site".into(), "chess-rs".into()),
+            ("Date".into(), date),
+            ("Round".into(), "-".into()),
+            ("White".into(), white),
+            ("Black".into(), black),
+            ("Time".into(), time),
+            ("Mode".into(), self.mode.label().into()),
+        ];
+    }
+
+    /// The current game as PGN, with tags.
+    pub fn current_pgn(&self) -> PgnGame {
+        let mut pgn = PgnGame::from_game(&self.game);
+        pgn.tags = self.record_tags.clone();
+        if self.mode != Mode::HumanVsHuman {
+            pgn.set_tag("BotDepth", self.depth.to_string());
+        }
+        pgn.set_tag("PlyCount", self.game.ply_count().to_string());
+        match self.game.result() {
+            Some(r) => pgn.set_tag("Termination", r.describe()),
+            None => pgn.set_tag("Termination", "unfinished"),
+        }
+        pgn
+    }
+
+    /// Save the current game after every change (no file for empty games).
+    pub fn autosave(&mut self) {
+        let Some(lib) = &self.library else { return };
+        if self.game.ply_count() == 0 {
+            if let Some(path) = self.record.take() {
+                let _ = lib.delete(&path);
+                self.games_dirty = true;
+            }
+            return;
+        }
+        let pgn = self.current_pgn();
+        let path = self.record.get_or_insert_with(|| lib.new_path(&pgn)).clone();
+        if let Err(e) = lib.save(&path, &pgn) {
+            self.message = Some(format!("Could not save game: {e}"));
+        }
+        self.games_dirty = true;
     }
 
     pub fn load_fen(&mut self, fen: &str) -> Result<(), String> {
@@ -504,7 +622,11 @@ impl ChessApp {
     // ------------------------------------------------------------ UI
 
     fn handle_keys(&mut self, ui: &Ui) {
-        if ui.ctx().egui_wants_keyboard_input() {
+        if self.tab == Tab::Review {
+            self.review_keys(ui);
+            return;
+        }
+        if self.tab != Tab::Play || ui.ctx().egui_wants_keyboard_input() {
             return;
         }
         let (undo, flip, hint, new, left, right, home, end, esc, now) = ui.input_mut(|i| {
@@ -561,10 +683,42 @@ impl ChessApp {
         self.tick();
         self.handle_keys(ui);
 
-        egui::Panel::right("side_panel").resizable(false).exact_size(390.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.side_panel(ui));
+        egui::Panel::top("tabs").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("chess-rs").size(20.0).strong());
+                ui.add_space(16.0);
+                let before = self.tab;
+                ui.selectable_value(&mut self.tab, Tab::Play, RichText::new("Play").size(17.0));
+                ui.selectable_value(&mut self.tab, Tab::Games, RichText::new("Games").size(17.0));
+                ui.selectable_value(&mut self.tab, Tab::Review, RichText::new("Game Review").size(17.0));
+                if self.tab != before && self.tab == Tab::Games {
+                    self.refresh_games();
+                }
+            });
         });
-        egui::CentralPanel::default().show(ui, |ui| self.board_area(ui));
+        match self.tab {
+            Tab::Play => {
+                egui::Panel::right("side_panel").resizable(false).exact_size(390.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| self.side_panel(ui));
+                });
+                egui::CentralPanel::default().show(ui, |ui| self.board_area(ui));
+            }
+            Tab::Games => {
+                egui::CentralPanel::default().show(ui, |ui| self.games_tab(ui));
+            }
+            Tab::Review => {
+                egui::Panel::right("review_panel").resizable(false).exact_size(390.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("review_scroll")
+                        .auto_shrink(false)
+                        .show(ui, |ui| self.review_side_panel(ui));
+                });
+                egui::CentralPanel::default().show(ui, |ui| self.review_board_area(ui));
+            }
+        }
+        if self.review.as_ref().is_some_and(|r| r.is_running()) {
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
 
         // Live "positions searched" counter while the engine works.
         if self.job.is_some() {
@@ -614,6 +768,8 @@ impl ChessApp {
                     hint: if shown_ply == n { self.hint } else { None },
                     show_legal: self.show_legal,
                     images: &self.images,
+                    arrows: &[],
+                    badge: None,
                 };
                 if let Some((from, to)) = board::board_ui(ui, &mut self.board, &view, size) {
                     self.user_move(from, to);
@@ -625,12 +781,12 @@ impl ChessApp {
                 if ui.button("«").on_hover_text("First position (Home)").clicked() {
                     self.view_ply = Some(0);
                 }
-                if ui.button("‹").on_hover_text("Previous move (←)").clicked() {
+                if ui.button("‹").on_hover_text("Previous move (Left arrow)").clicked() {
                     self.view_ply = Some(shown_ply.saturating_sub(1));
                 }
                 let label = if shown_ply == n { format!("ply {n}") } else { format!("ply {shown_ply}/{n}") };
                 ui.label(RichText::new(label).monospace());
-                if ui.button("›").on_hover_text("Next move (→)").clicked() {
+                if ui.button("›").on_hover_text("Next move (Right arrow)").clicked() {
                     self.view_ply = if shown_ply + 1 >= n { None } else { Some(shown_ply + 1) };
                 }
                 if ui.button("»").on_hover_text("Current position (End)").clicked() {
@@ -699,8 +855,6 @@ impl ChessApp {
 
     fn side_panel(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
-        ui.heading(RichText::new("chess-rs").strong());
-        ui.add_space(2.0);
         let status_color = if self.game.result().is_some() {
             Color32::from_rgb(230, 170, 60)
         } else {
@@ -737,9 +891,18 @@ impl ChessApp {
                 ui.radio_value(&mut self.side_pick, SidePick::Random, "Random");
             });
         }
-        if ui.button("New game").on_hover_text("Ctrl+N").clicked() {
-            self.new_game();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("New game").on_hover_text("Ctrl+N").clicked() {
+                self.new_game();
+            }
+            if ui
+                .add_enabled(self.game.ply_count() > 0, egui::Button::new("Game review"))
+                .on_hover_text("Analyse this game: accuracy, mistakes, best moves")
+                .clicked()
+            {
+                self.review_current_game();
+            }
+        });
         ui.separator();
 
         // ---- strength ----

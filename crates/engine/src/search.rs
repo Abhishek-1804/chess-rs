@@ -87,6 +87,8 @@ pub struct Limits {
     pub depth: Option<u32>,
     pub movetime: Option<Duration>,
     pub nodes: Option<u64>,
+    /// Root moves to leave out (used to find the best *alternative* move).
+    pub excluded: Vec<Move>,
 }
 
 impl Limits {
@@ -180,7 +182,26 @@ impl Engine {
         mut on_info: impl FnMut(&SearchInfo),
     ) -> SearchResult {
         let start = Instant::now();
-        let root_moves = legal_moves(pos);
+        let mut root_moves = legal_moves(pos);
+        if !limits.excluded.is_empty() {
+            let mut kept = MoveList::new();
+            for &m in root_moves.iter().filter(|m| !limits.excluded.contains(m)) {
+                kept.push(m);
+            }
+            if kept.is_empty() {
+                // Every legal move excluded: nothing to search.
+                return SearchResult {
+                    best_move: None,
+                    score: 0,
+                    depth: 0,
+                    seldepth: 0,
+                    nodes: 0,
+                    time: start.elapsed(),
+                    pv: Vec::new(),
+                };
+            }
+            root_moves = kept;
+        }
         let mut result = SearchResult {
             best_move: root_moves.first().copied(),
             score: 0,
@@ -537,6 +558,14 @@ impl<'a> Worker<'a> {
         if moves.is_empty() {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
+        let excluding = root && !self.sh.limits.excluded.is_empty();
+        if excluding {
+            let mut kept = MoveList::new();
+            for &m in moves.iter().filter(|m| !self.sh.limits.excluded.contains(m)) {
+                kept.push(m);
+            }
+            moves = kept;
+        }
         // With very few legal moves zugzwang is likely: "passing" (null move)
         // and "the static eval is good enough" (RFP) are both unsound there.
         let zugzwang_risk = moves.len() <= 6;
@@ -690,7 +719,10 @@ impl<'a> Worker<'a> {
             Bound::Upper
         };
         let eval_store = if in_check { 0 } else { static_eval };
-        self.sh.tt.store(pos.hash(), best_move, score_to_tt(best_score, ply), eval_store, depth, bound);
+        // A root searched without some moves is not this position's true value.
+        if !excluding {
+            self.sh.tt.store(pos.hash(), best_move, score_to_tt(best_score, ply), eval_store, depth, bound);
+        }
         best_score
     }
 

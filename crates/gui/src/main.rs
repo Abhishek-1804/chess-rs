@@ -3,12 +3,16 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use chess_rs::{AppConfig, ChessApp, Mode, SidePick, default_cache_path};
+use chess_rs::library::GameLibrary;
+use chess_rs::selfplay::{SelfPlay, generate};
+use chess_rs::{AppConfig, ChessApp, Mode, SidePick, default_cache_path, default_games_dir};
 
 const USAGE: &str = "\
 chess-rs — play chess against a multi-threaded alpha-beta engine
 
-USAGE: chess-rs [OPTIONS]
+USAGE:
+  chess-rs [OPTIONS]                 open the game
+  chess-rs selfplay [SELFPLAY OPTS]  play bot-vs-bot games headlessly into the games folder
 
 OPTIONS:
   -d, --depth <N>      Bot search depth in plies (1-40)            [default: 12]
@@ -19,11 +23,25 @@ OPTIONS:
       --fen <FEN>      Start from a custom position
       --cache <PATH>   Position cache file      [default: <project>/cache/positions.bin]
       --no-cache       Do not read or write the on-disk position cache
+      --games-dir <P>  Where games are saved                   [default: <project>/games]
+      --no-games       Do not save games
+      --review-depth <N>  Search depth for Game Review (1-40)   [default: 14]
   -h, --help           Show this help
+
+SELFPLAY OPTS:
+      --games <N>      Number of games                             [default: 6]
+  -d, --depth <N>      Search depth for both sides                 [default: 4]
+      --random <N>     Random opening plies, for variety           [default: 4]
+  -t, --threads <N>    Search threads                              [default: all cores]
+      --games-dir <P>  Output folder                   [default: <project>/games]
 ";
 
 fn parse_args() -> Result<AppConfig, String> {
-    let mut cfg = AppConfig { cache_path: Some(default_cache_path()), ..AppConfig::default() };
+    let mut cfg = AppConfig {
+        cache_path: Some(default_cache_path()),
+        games_dir: Some(default_games_dir()),
+        ..AppConfig::default()
+    };
     if let Ok(p) = std::env::var("CHESS_RS_CACHE") {
         cfg.cache_path = Some(p.into());
     }
@@ -62,6 +80,11 @@ fn parse_args() -> Result<AppConfig, String> {
             "--fen" => cfg.fen = Some(val("--fen")?),
             "--cache" => cfg.cache_path = Some(val("--cache")?.into()),
             "--no-cache" => cfg.cache_path = None,
+            "--games-dir" => cfg.games_dir = Some(val("--games-dir")?.into()),
+            "--no-games" => cfg.games_dir = None,
+            "--review-depth" => {
+                cfg.review_depth = val("--review-depth")?.parse().map_err(|_| "review depth must be a number")?
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -71,7 +94,54 @@ fn parse_args() -> Result<AppConfig, String> {
     Ok(cfg)
 }
 
+fn selfplay(args: &[String]) -> Result<(), String> {
+    let mut cfg = SelfPlay {
+        games: 6,
+        depth: 4,
+        threads: chess_engine::default_threads(),
+        random_plies: 4,
+        seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64),
+    };
+    let mut dir = default_games_dir();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut num = |name: &str| -> Result<u64, String> {
+            it.next().ok_or(format!("{name} needs a value"))?.parse().map_err(|_| format!("{name} must be a number"))
+        };
+        match a.as_str() {
+            "--games" => cfg.games = num("--games")? as usize,
+            "-d" | "--depth" => cfg.depth = num("--depth")?.clamp(1, 40) as u32,
+            "--random" => cfg.random_plies = num("--random")? as usize,
+            "-t" | "--threads" => cfg.threads = num("--threads")?.max(1) as usize,
+            "--games-dir" => dir = it.next().ok_or("--games-dir needs a value")?.into(),
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown selfplay argument '{other}'")),
+        }
+    }
+    let lib = GameLibrary::new(&dir);
+    println!("Playing {} games at depth {} into {}", cfg.games, cfg.depth, dir.display());
+    generate(&lib, &cfg, |i, path, summary| {
+        println!("  game {}: {summary} -> {}", i + 1, path.file_name().unwrap_or_default().to_string_lossy());
+    })
+    .map_err(|e| e.to_string())?;
+    println!("Done. Open the Games tab (mise run play) to browse and review them.");
+    Ok(())
+}
+
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("selfplay") {
+        return match selfplay(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}\n\n{USAGE}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let cfg = match parse_args() {
         Ok(c) => c,
         Err(e) => {

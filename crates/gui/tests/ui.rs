@@ -17,14 +17,30 @@ type H = Harness<'static, Option<ChessApp>>;
 fn cfg() -> AppConfig {
     AppConfig {
         depth: 4,
-        threads: 2,
+        threads: 1,
         hash_mb: 16,
         cache_path: None,
         mode: Mode::HumanVsBot,
         side: SidePick::White,
         fen: None,
         bot_delay: Duration::ZERO,
+        games_dir: None,
+        review_depth: 5,
     }
+}
+
+fn temp_games_dir(name: &str) -> PathBuf {
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("games-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+fn play_san(h: &mut H, moves: &[&str]) {
+    for s in moves {
+        let m = chess_engine::parse_move(app(h).game.position(), s).unwrap();
+        app_mut(h).play_move(m);
+    }
+    h.step();
 }
 
 fn harness_with(cfg: AppConfig, render: bool) -> H {
@@ -398,4 +414,142 @@ fn thousands_separators() {
     assert_eq!(with_commas(1_000), "1,000");
     assert_eq!(with_commas(12_345_678), "12,345,678");
     assert_eq!(with_commas(u64::MAX), "18,446,744,073,709,551,615");
+}
+
+#[test]
+fn games_are_autosaved_and_undo_updates_the_file() {
+    let dir = temp_games_dir("autosave");
+    let mut h = harness(AppConfig { games_dir: Some(dir.clone()), ..cfg() });
+    click_square(&mut h, "e2");
+    click_square(&mut h, "e4");
+    wait(&mut h, "bot reply", |a| a.game.ply_count() == 2);
+    let path = app(&h).record.clone().expect("game file created on first move");
+    let saved = chess_engine::pgn::parse_one(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.moves.len(), 2);
+    assert_eq!(saved.tag("White"), Some("Human"));
+    assert_eq!(saved.tag("Black"), Some("chess-rs"));
+    assert_eq!(saved.result, "*");
+    click_button(&mut h, "Undo");
+    assert!(!path.exists(), "a game undone back to the start leaves no file");
+    click_square(&mut h, "d2");
+    click_square(&mut h, "d4");
+    wait(&mut h, "bot reply", |a| a.game.ply_count() == 2);
+    click_button(&mut h, "Resign");
+    let path = app(&h).record.clone().unwrap();
+    let saved = chess_engine::pgn::parse_one(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.result, "0-1");
+    assert!(saved.tag("Termination").unwrap().contains("resigns"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review_current_game_rates_the_blunder() {
+    let dir = temp_games_dir("review");
+    let mut h = harness_with(AppConfig { games_dir: Some(dir.clone()), mode: Mode::HumanVsHuman, ..cfg() }, true);
+    play_san(&mut h, &["f3", "e5", "g4", "Qh4#"]);
+    assert!(app(&h).game.result().is_some());
+    click_button(&mut h, "Game review");
+    assert_eq!(app(&h).tab, chess_rs::Tab::Review);
+    wait(&mut h, "analysis", |a| a.review.as_ref().is_some_and(|r| r.review.is_some()));
+    let r = app(&h).review.as_ref().unwrap().review.clone().unwrap();
+    use chess_engine::analysis::MoveClass;
+    assert_eq!(r.moves[2].class, MoveClass::Blunder, "2.g4?? allows mate");
+    assert!(matches!(r.moves[3].class, MoveClass::Best | MoveClass::Great | MoveClass::Brilliant));
+    assert!(r.accuracy[1] > r.accuracy[0], "Black played better: {:?}", r.accuracy);
+    // Summary UI shows accuracy cards and the rating table.
+    h.step();
+    assert!(h.query_by_label_contains("White accuracy").is_some());
+    assert!(h.query_by_label("Blunder").is_some());
+    // Navigate: keys, then clicking the evaluation graph.
+    h.key_press(egui::Key::End);
+    h.step();
+    assert_eq!(app(&h).review.as_ref().unwrap().ply, 4);
+    h.key_press(egui::Key::ArrowLeft);
+    h.step();
+    assert_eq!(app(&h).review.as_ref().unwrap().ply, 3);
+    assert!(h.query_by_label_contains("is a blunder").is_some(), "explains the blunder");
+    assert!(h.query_by_label_contains("Best was").is_some(), "names the better move");
+    for _ in 0..3 {
+        h.step();
+    }
+    h.render().unwrap().save(shots_dir().join("07-game-review.png")).unwrap();
+
+    // The review was stored in the game's PGN file.
+    let path = app(&h).record.clone().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[%eval") && text.contains("WhiteAccuracy"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn games_tab_lists_reviews_and_deletes() {
+    let dir = temp_games_dir("tab");
+    // Seed the folder with two self-play games.
+    let lib = chess_rs::library::GameLibrary::new(&dir);
+    let sp = chess_rs::selfplay::SelfPlay { games: 2, depth: 2, threads: 1, random_plies: 4, seed: 7 };
+    chess_rs::selfplay::generate(&lib, &sp, |_, _, _| {}).unwrap();
+
+    let mut h = harness_with(AppConfig { games_dir: Some(dir.clone()), review_depth: 3, ..cfg() }, true);
+    click_button(&mut h, "Games");
+    assert_eq!(app(&h).tab, chess_rs::Tab::Games);
+    assert_eq!(app(&h).games.len(), 2);
+    assert!(h.query_by_label_contains("Saved games (2)").is_some());
+    for _ in 0..3 {
+        h.step();
+    }
+    h.render().unwrap().save(shots_dir().join("08-games-tab.png")).unwrap();
+
+    // Review the first game: it is analysed and the file gains accuracy tags.
+    h.get_all_by_label("Review").next().unwrap().click();
+    h.step();
+    assert_eq!(app(&h).tab, chess_rs::Tab::Review);
+    wait(&mut h, "analysis", |a| a.review.as_ref().is_some_and(|r| r.review.is_some()));
+    click_button(&mut h, "Games");
+    h.step();
+    assert!(app(&h).games.iter().any(|g| g.accuracy.is_some()), "reviewed game shows its accuracy");
+
+    // Clicking a graph point jumps there (reopen the review first).
+    click_button(&mut h, "Game Review");
+    let n = app(&h).review.as_ref().unwrap().game.ply_count();
+    let rect = app(&h).board.rect;
+    let graph_y = rect.bottom() + 34.0 + 6.0 + 8.0 + 40.0;
+    let x = rect.left() - 28.0 + (rect.width() + 28.0) * 0.5;
+    h.hover_at(egui::pos2(x, graph_y));
+    h.step();
+    h.drag_at(egui::pos2(x, graph_y));
+    h.step();
+    h.drop_at(egui::pos2(x, graph_y));
+    h.step();
+    let ply = app(&h).review.as_ref().unwrap().ply;
+    assert!(ply.abs_diff(n / 2) <= 1, "graph click at the middle -> ply {ply} of {n}");
+
+    // Delete needs confirmation.
+    click_button(&mut h, "Games");
+    h.get_all_by_label("Delete").next().unwrap().click();
+    h.step();
+    h.step();
+    assert_eq!(app(&h).games.len(), 2, "first click only asks");
+    click_button(&mut h, "Confirm delete");
+    assert_eq!(app(&h).games.len(), 1);
+    assert_eq!(lib.list().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review_a_pasted_pgn() {
+    let mut h = harness(AppConfig { review_depth: 3, ..cfg() });
+    click_button(&mut h, "Games");
+    app_mut(&mut h).open_review(
+        chess_engine::pgn::parse_one("1. e4 e5 2. Qh5 Nc6 3. Bc4 Nf6 4. Qxf7# 1-0").unwrap(),
+        None,
+        true,
+    );
+    wait(&mut h, "analysis", |a| a.review.as_ref().is_some_and(|r| r.review.is_some()));
+    let r = app(&h).review.as_ref().unwrap().review.clone().unwrap();
+    assert_eq!(r.moves[5].class, chess_engine::analysis::MoveClass::Blunder, "3...Nf6??");
+    // Stop / re-analyse controls exist.
+    click_button(&mut h, "Re-analyze");
+    assert!(app(&h).review.as_ref().unwrap().is_running());
+    click_button(&mut h, "Stop analysis");
+    assert!(!app(&h).review.as_ref().unwrap().is_running());
 }

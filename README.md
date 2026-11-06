@@ -31,6 +31,39 @@ mise run play       # play!
   Copy FEN/PGN, Load FEN.
 - **Modes**: Human vs Bot, Bot vs Bot (watch it play itself), Human vs Human.
 
+### Saved games
+
+Every game is saved automatically as a standard PGN file in `games/`. The file is rewritten
+after every move, so nothing is lost if the app closes mid-game, and it opens in any chess program.
+The **Games** tab lists them newest first, with result, length and review accuracy, plus
+**Review** and **Delete** buttons. You can also paste any PGN there to review it.
+
+To fill the library quickly, let the bot play itself:
+
+```sh
+mise run games:generate                          # 6 games at depth 4
+mise run games:generate -- --games 10 --depth 6
+```
+
+Each self-play game starts with a few random opening moves so the games differ.
+
+### Game Review (like chess.com)
+
+Open **Game Review** (from the Play tab's *Game review* button, or **Review** in the Games
+tab). The engine analyses every position and shows:
+
+- an **accuracy** score per player (lichess's accuracy formula on win-percentage loss);
+- a rating for every move: **Brilliant** (a sound piece sacrifice), **Great** (the only good
+  move), **Best**, **Excellent**, **Good**, **Inaccuracy**, **Mistake**, **Miss** (failing to
+  punish an opponent's error), **Blunder** and **Forced**. These use chess.com's
+  expected-points bands, and each has a symbol (!!, !, ?!, ?, ??) as well as a colour;
+- an **evaluation graph**: hover for details, and click or drag to jump to any move;
+- for each move, an explanation ("g4 is a blunder"), the change in evaluation, and the better
+  move with its line (green arrow). The blue arrow is the engine's best move in the position shown.
+
+Reviews are saved into the game's PGN file as standard `[%eval]` comments and move annotations,
+so reopening a reviewed game is instant and other tools such as lichess can read them.
+
 | Shortcut | Action |
 |---|---|
 | Ctrl+Z | Undo |
@@ -55,7 +88,7 @@ mise run help                   # all options
 
 ## Position cache (persists across games)
 
-Every position the bot finishes searching is remembered in `cache/positions.bin`, along with the deep
+Separately from saved games, every position the bot finishes searching is remembered in `cache/positions.bin`, along with the deep
 entries of its transposition table. On the next game, or the next time you launch the app:
 
 - if the bot reaches a position it has already searched at least as deeply, it replies **instantly**
@@ -81,10 +114,14 @@ Openings repeat a lot, so the bot gets faster the more you play. The cache:
 | `mise run test:gui` | GUI tests; screenshots land in `target/tmp/ui-screenshots/` |
 | `mise run test:deep` | Deep perft validation (tens of billions of nodes) |
 | `mise run ci` | Format check + clippy (warnings are errors) + tests |
+| `mise run review -- game.pgn` | Review PGN games in the terminal (see [Command-line tool](#command-line-tool-chess-cli)) |
+| `mise run cli -- help` | Any `chess-cli` command; `help` prints the full reference |
 | `mise run perft -- 6` | Count legal move-tree leaves (`--fen`, `--divide`) |
 | `mise run bench -- --depth 14` | Search speed benchmark (`--threads N`) |
 | `mise run analyze -- --fen "<FEN>" --depth 20` | Analyse a position in the terminal |
 | `mise run lint` / `mise run fmt` | Clippy / rustfmt |
+| `mise run games:generate` | Bot-vs-bot games into your library (`--games N --depth D`) |
+| `mise run games:list` / `mise run games:clear` | List / delete saved games |
 | `mise run cache:clear` | Delete the position cache |
 
 ## How it works
@@ -158,7 +195,11 @@ programming community; see `crates/engine/tests/data/SOURCES.md` for where each 
 | Soundness | Pruned search must agree with plain alpha-beta on forced mates. Each pruning technique can be switched off, and the engine must still work. |
 | Invariants | Incremental hash and evaluation equal a from-scratch recomputation; the evaluation is colour-symmetric; FEN and SAN round-trip; magic lookups match slow reference attacks. |
 | Rules | Fool's mate, stalemate, threefold repetition, fifty-move rule, insufficient material, undo, PGN export. |
-| GUI end-to-end | The real app driven headlessly (egui_kittest): clicking, dragging, en passant, castling, promotion picker, checkmate, undo, hint, keyboard shortcuts, Move now, the live positions counter, cache reuse and persistence across restarts. It also renders screenshots. |
+| PGN | Reads real-world PGN (comments, variations, NAGs, `0-0`, custom FEN starts). Anderssen's *Immortal Game* and Morphy's *Opera Game* must parse and end in checkmate, and writing them back out must be byte-identical. |
+| Game Review | lichess win-% and accuracy formulas, every rating band, Forced/Great/Brilliant/Miss detection, the Opera Game review (Morphy's accuracy beats his opponent's), and reviews surviving a round trip through PGN. |
+| GUI end-to-end | The real app driven headlessly (egui_kittest): clicking, dragging, en passant, castling, promotion picker, checkmate, undo, hint, keyboard shortcuts, Move now, the live positions counter, cache reuse and persistence across restarts, games autosaved and updated on undo/resign,
+the Games tab (list, review, delete with confirmation), Game Review (rates fool's mate's `2.g4`
+as a blunder, accuracy cards, eval-graph clicks), and reviewing pasted PGN. It also renders screenshots. |
 
 As a sanity check that the suite catches real bugs, these were injected one at a time; each one made
 between 3 and 14 tests fail:
@@ -172,13 +213,106 @@ between 3 and 14 tests fail:
 - mate scores ignore distance
 - pinned pieces move freely
 
-## Engine tools
+## Command-line tool (`chess-cli`)
+
+Everything the engine can do is also available from the terminal, using standard chess formats
+(PGN for games, FEN for positions), so it works with games from chess.com, lichess or any other
+tool. Run it with `mise run cli -- <command> ...`. Shortcuts exist for the common commands
+(`mise run review -- ...`, `mise run analyze -- ...`, `mise run perft -- ...`, `mise run bench -- ...`),
+and `mise run cli -- help` prints the full reference.
+
+> File paths are relative to the project folder (where mise runs tasks); use absolute paths for
+> files elsewhere. After `mise run build` you can also call the binary directly from anywhere:
+> `/path/to/chess-rs/target/release/chess-cli review ~/Downloads/game.pgn`.
+
+### `review`: Game Review for any PGN
 
 ```sh
-mise run perft -- 6 --fen "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
-mise run analyze -- --fen "<FEN>" --depth 20
-mise run analyze -- --fen "<FEN>" --depth 12 --no-pruning   # plain alpha-beta, for comparison
+mise run review -- my_game.pgn                      # every game in the file
+mise run review -- lichess_export.pgn --game 3      # just the 3rd game
+mise run review -- game.pgn --depth 18              # deeper (slower, more precise)
+mise run review -- game.pgn --format pgn > annotated.pgn
+mise run review -- games/*.pgn --depth 10          # every game you've played in chess-rs
 ```
 
-`chess-cli mate <n> --fen "<FEN>"` is an exhaustive forced-mate solver with no pruning, useful for
-checking puzzles.
+This gives the same review as the app: accuracy per player, a rating for every move, and the
+better move (with the engine's line) for every inaccuracy, mistake, miss and blunder. Example
+(Morphy's Opera Game, abridged):
+
+```
+Game 2/2: Paul Morphy vs Duke Karl / Count Isouard (1-0)  Paris FRA 1858.??.??
+Reviewed at depth 12, 33 plies
+
+                     White   Black
+Accuracy              96.2    85.9
+Brilliant (!!)           2       0
+Great (!)                5       0
+...
+Moves (evaluation after the move, from White's side):
+    1. e4       Best *           +0.30
+  4... Bxf3     Inaccuracy ?!    +1.10   better: Nc6  (Nc6 exd6 Qxd6 Qxd6 Bxd6 Be3)
+   10. Nxb5     Brilliant !!     +1.19
+ 11... Nbd7     Mistake ?        +3.12   better: Kd8  (Kd8 Bxf6 gxf6 Qd5+ Kc8 Ba6+)
+   13. Rxd7     Brilliant !!     +5.99
+   17. Rd8#     Great !           mate
+```
+
+| Option | Meaning | Default |
+|---|---|---|
+| `<FILE.pgn>...` or `-` | One or more PGN files (each may hold many games), or `-` for stdin | required |
+| `--depth <N>` | Analysis depth in plies (higher = slower, more accurate) | 14 |
+| `--game <N>` | Only review game N of a multi-game file (counting from 1) | all games |
+| `--format text\|pgn` | `text`: the report above. `pgn`: the game with the review embedded | text |
+| `--out <FILE>` | Also write the annotated PGN to a file | none |
+| `--threads <N>` | Search threads. `1` gives exactly reproducible results | all cores |
+| `--hash <MB>` | Transposition table size | 256 |
+
+The annotated PGN stores the review in standard form: `[%eval]` comments after every move,
+move-quality symbols (`$4` = `??`, `$2` = `?`, `$6` = `?!`, `$1` = `!`, `$3` = `!!`), and
+`WhiteAccuracy`/`BlackAccuracy` tags. lichess and most chess programs can import it.
+
+Getting your games:
+
+- **chess.com**: open a game, then *Share*, *PGN*, *Download*.
+- **lichess**: on a game, *Share & export*, *Download PGN*. Or export all your games from your profile.
+- **chess-rs**: every game is already in `games/`.
+
+The report goes to stdout and progress to stderr, so `> report.txt` saves just the report.
+The command exits with code 1 (and a clear message) if a file can't be read or a move in the PGN is
+illegal, naming the bad move.
+
+### `search`: analyse a position
+
+```sh
+mise run analyze -- --fen "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3" --depth 20
+mise run analyze -- --pgn game.pgn --depth 18      # the position at the end of the game
+```
+
+This prints each completed depth: score (`cp` = centipawns, from the side to move's perspective;
+`mate N`), nodes, speed, time and the best line in SAN, then `bestmove`. Options: `--fen`,
+`--pgn <FILE>` (with `--game N`), `--depth` (default 12), `--threads`, `--hash`. For debugging,
+`--no-pruning` (or `--no-nmp`, `--no-rfp`, `--no-futility`, `--no-lmp`, `--no-lmr`) turns off
+the corresponding search shortcuts.
+
+### `mate`: forced-mate solver
+
+```sh
+mise run cli -- mate 2 --fen "r2qkb1r/pp2nppp/3p4/2pNN1B1/2BnP3/3P4/PPP2PPP/R2bK2R w KQkq - 1 1"
+# mate in 2: Nf6+ (0.00s)
+```
+
+This is an exhaustive search with no pruning, so the answer is a proof: it finds the shortest
+forced mate up to N moves, or reports `no forced mate in N`. It is useful for checking puzzles. The
+cost grows quickly; up to about 4 moves is fast.
+
+### `perft` and `bench`: engine checks
+
+```sh
+mise run perft -- 6                    # nodes 119060324 (the standard start-position count)
+mise run perft -- 4 --fen "<FEN>" --divide
+mise run bench -- --depth 14 --threads 8
+```
+
+`perft` counts every legal move sequence to a depth and compares against published numbers,
+which makes it the standard test of a move generator. `--divide` breaks the count down by first
+move, for tracking down a bug. `bench` measures search speed on 8 fixed positions.

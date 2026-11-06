@@ -64,6 +64,10 @@ pub struct BoardView<'a> {
     pub hint: Option<Move>,
     pub show_legal: bool,
     pub images: &'a PieceImages,
+    /// Extra arrows, e.g. the engine's best move in game review.
+    pub arrows: &'a [(Move, Color32)],
+    /// A rating badge (square, colour, symbol) on a square's corner.
+    pub badge: Option<(Square, Color32, &'a str)>,
 }
 
 /// Draw the board; returns a (from, to) pair when the user completes a move.
@@ -213,9 +217,21 @@ pub fn board_ui(ui: &mut Ui, state: &mut BoardState, view: &BoardView, size: f32
         view.images.get(p).paint_at(ui, state.square_rect(sq));
     }
 
-    // ---- hint arrow ----
+    // ---- hint and review arrows ----
     if let Some(h) = view.hint {
         arrow(&painter, state.square_rect(h.from()).center(), state.square_rect(h.to()).center(), s, s * 0.14, HINT);
+    }
+    for &(m, c) in view.arrows {
+        arrow(&painter, state.square_rect(m.from()).center(), state.square_rect(m.to()).center(), s, s * 0.14, c);
+    }
+
+    // ---- rating badge (top-right corner of the square) ----
+    if let Some((sq, color, symbol)) = view.badge {
+        let r = state.square_rect(sq);
+        let center = r.right_top() + vec2(-s * 0.12, s * 0.12);
+        painter.circle_filled(center, s * 0.17, color);
+        painter.circle_stroke(center, s * 0.17, Stroke::new(1.5, Color32::WHITE));
+        painter.text(center, Align2::CENTER_CENTER, symbol, FontId::proportional(s * 0.2), Color32::WHITE);
     }
 
     // ---- dragged piece follows the pointer ----

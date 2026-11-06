@@ -278,3 +278,21 @@ fn live_node_counter() {
     assert_eq!(counter.load(Ordering::Relaxed), r2.nodes, "counter resets for each search");
     assert!(r2.nodes < r.nodes);
 }
+
+/// Excluding root moves finds the best *alternative*; excluding all yields nothing.
+#[test]
+fn excluded_root_moves() {
+    let pos = Position::from_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1").unwrap();
+    let mate = parse_move(&pos, "Rd8#").unwrap();
+    let eng = engine(1);
+    let r =
+        eng.search(&pos, &[], &Limits { excluded: vec![mate], ..Limits::depth(5) }, &AtomicBool::new(false), |_| {});
+    assert_ne!(r.best_move, Some(mate));
+    assert!(mate_in(r.score).is_none(), "no other mate in 1: {}", r.score);
+    // The excluded search must not poison the TT: a normal search still mates.
+    let r = eng.search(&pos, &[], &Limits::depth(3), &AtomicBool::new(false), |_| {});
+    assert_eq!(r.best_move, Some(mate));
+    let all = legal_moves(&pos).to_vec();
+    let r = eng.search(&pos, &[], &Limits { excluded: all, ..Limits::depth(3) }, &AtomicBool::new(false), |_| {});
+    assert_eq!(r.best_move, None);
+}

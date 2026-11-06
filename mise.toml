@@ -44,17 +44,25 @@ run = "cargo test --release -p chess-rs"
 description = "Deep perft validation: billions of nodes (~1 minute on many cores)"
 run = "cargo test --release -p chess-engine -- --ignored"
 
+[tasks.review]
+description = "Review PGN games in the terminal (chess.com-style), e.g. `mise run review -- my_game.pgn --depth 16`"
+run = "cargo run -q --release -p chess-engine --bin chess-cli -- review"
+
+[tasks.cli]
+description = "Run any chess-cli command, e.g. `mise run cli -- help` or `mise run cli -- mate 3 --fen \"<FEN>\"`"
+run = "cargo run -q --release -p chess-engine --bin chess-cli --"
+
 [tasks.perft]
 description = "Count move-tree leaves, e.g. `mise run perft -- 6` or `mise run perft -- 5 --fen \"<FEN>\" --divide`"
-run = "cargo run --release -p chess-engine --bin chess-cli -- perft"
+run = "cargo run -q --release -p chess-engine --bin chess-cli -- perft"
 
 [tasks.bench]
 description = "Search speed benchmark, e.g. `mise run bench -- --depth 14 --threads 8`"
-run = "cargo run --release -p chess-engine --bin chess-cli -- bench"
+run = "cargo run -q --release -p chess-engine --bin chess-cli -- bench"
 
 [tasks.analyze]
 description = "Analyse a position from the terminal, e.g. `mise run analyze -- --fen \"<FEN>\" --depth 18`"
-run = "cargo run --release -p chess-engine --bin chess-cli -- search"
+run = "cargo run -q --release -p chess-engine --bin chess-cli -- search"
 
 [tasks.lint]
 description = "Clippy with warnings as errors"
@@ -71,6 +79,18 @@ run = "cargo fmt --all -- --check"
 [tasks.ci]
 description = "Everything CI should run: format check, lint, tests"
 depends = ["fmt:check", "lint", "test"]
+
+[tasks."games:generate"]
+description = "Let the bot play itself to fill your games library, e.g. `mise run games:generate -- --games 6 --depth 4`"
+run = "cargo run --release -p chess-rs -- selfplay"
+
+[tasks."games:list"]
+description = "List saved games (PGN files in games/)"
+run = "ls -1 games/*.pgn 2>/dev/null || echo 'No saved games yet'"
+
+[tasks."games:clear"]
+description = "Delete all saved games (games/)"
+run = "rm -rf games"
 
 [tasks."cache:clear"]
 description = "Delete the persistent position cache (cache/positions.bin)"

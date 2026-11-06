@@ -5,6 +5,7 @@
 //! * Alpha-beta minimax (negamax/PVS) with a lock-free shared TT and Lazy SMP
 //! * A persistent on-disk position cache shared across games
 
+pub mod analysis;
 pub mod attacks;
 pub mod cache;
 pub mod endgame;
@@ -12,6 +13,7 @@ pub mod eval;
 pub mod game;
 pub mod movegen;
 pub mod notation;
+pub mod pgn;
 pub mod position;
 pub mod psqt;
 pub mod search;
