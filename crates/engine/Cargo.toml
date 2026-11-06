@@ -1,0 +1,16 @@
+[package]
+name = "chess-engine"
+description = "Bitboard chess engine: magic move generation, lock-free TT, Lazy SMP alpha-beta"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lib]
+name = "chess_engine"
+
+[[bin]]
+name = "chess-cli"
+path = "src/bin/cli.rs"
+
+[dependencies]

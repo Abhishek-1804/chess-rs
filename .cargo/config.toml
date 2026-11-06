@@ -1,0 +1,3 @@
+# Build for the host CPU so popcnt/tzcnt/BMI are used for bitboard ops.
+[build]
+rustflags = ["-C", "target-cpu=native"]

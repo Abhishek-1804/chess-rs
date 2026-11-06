@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/engine", "crates/gui"]
+default-members = ["crates/engine", "crates/gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.dev]
+# The engine is unusably slow at opt-level 0; keep debug builds playable.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true

@@ -1,0 +1,15 @@
+[package]
+name = "chess-rs"
+description = "Play chess against a fast engine in a native GUI"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chess-engine = { path = "../engine" }
+eframe = "0.37"
+egui = "0.37"
+egui_extras = { version = "0.37", default-features = false, features = ["svg"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }

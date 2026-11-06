@@ -1,0 +1,77 @@
+# Everything in this project runs through mise: `mise run <task>`.
+# `mise tasks` lists them all. Only mise itself needs to be installed;
+# it downloads the pinned Rust toolchain on first use.
+
+[tools]
+rust = { version = "1.99.1", components = "rustfmt,clippy" }
+
+[env]
+CARGO_TERM_COLOR = "always"
+
+[tasks.setup]
+description = "Install the Rust toolchain and pre-build everything (first-time setup)"
+run = ["cargo fetch", "cargo build --release --workspace"]
+
+[tasks.play]
+description = "Play chess against the bot (GUI). Pass options after --, e.g. `mise run play -- --depth 16 --color black`"
+run = "cargo run --release -p chess-rs --"
+
+[tasks.watch]
+description = "Watch the bot play itself"
+run = "cargo run --release -p chess-rs -- --mode bot-vs-bot"
+
+[tasks.help]
+description = "Show all game options"
+run = "cargo run --release -p chess-rs -- --help"
+
+[tasks.build]
+description = "Build optimized binaries"
+run = "cargo build --release --workspace"
+
+[tasks.test]
+description = "Run the full test suite (engine + published suites + GUI end-to-end)"
+run = "cargo test --release --workspace"
+
+[tasks."test:engine"]
+description = "Engine tests only (move generation, search, rules, published suites)"
+run = "cargo test --release -p chess-engine"
+
+[tasks."test:gui"]
+description = "GUI end-to-end tests (headless) + screenshots in target/tmp/ui-screenshots"
+run = "cargo test --release -p chess-rs"
+
+[tasks."test:deep"]
+description = "Deep perft validation: billions of nodes (~1 minute on many cores)"
+run = "cargo test --release -p chess-engine -- --ignored"
+
+[tasks.perft]
+description = "Count move-tree leaves, e.g. `mise run perft -- 6` or `mise run perft -- 5 --fen \"<FEN>\" --divide`"
+run = "cargo run --release -p chess-engine --bin chess-cli -- perft"
+
+[tasks.bench]
+description = "Search speed benchmark, e.g. `mise run bench -- --depth 14 --threads 8`"
+run = "cargo run --release -p chess-engine --bin chess-cli -- bench"
+
+[tasks.analyze]
+description = "Analyse a position from the terminal, e.g. `mise run analyze -- --fen \"<FEN>\" --depth 18`"
+run = "cargo run --release -p chess-engine --bin chess-cli -- search"
+
+[tasks.lint]
+description = "Clippy with warnings as errors"
+run = "cargo clippy --release --workspace --all-targets -- -D warnings"
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.ci]
+description = "Everything CI should run: format check, lint, tests"
+depends = ["fmt:check", "lint", "test"]
+
+[tasks."cache:clear"]
+description = "Delete the persistent position cache (cache/positions.bin)"
+run = "rm -rf cache"
