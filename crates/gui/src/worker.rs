@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use chess_engine::cache::CacheStats;
-use chess_engine::{Engine, Limits, Move, Position, PositionCache, RootRecord, SearchInfo, SearchResult, legal_moves};
+use chess_engine::{Engine, Limits, Position, PositionCache, RootRecord, SearchInfo, SearchResult, legal_moves};
 
 /// What a search is for: the bot's move, or a hint for the human.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -94,11 +94,6 @@ impl EngineHandle {
 
     pub fn try_recv(&self) -> Option<Response> {
         self.rx.try_recv().ok()
-    }
-
-    /// Blocking receive with timeout (used by tests and shutdown).
-    pub fn recv_timeout(&self, d: std::time::Duration) -> Option<Response> {
-        self.rx.recv_timeout(d).ok()
     }
 
     /// Save the cache and stop the worker, waiting for it to finish.
@@ -189,9 +184,4 @@ fn worker(mut engine: Engine, cfg: EngineConfig, rx: Receiver<Request>, tx: Send
             Request::Shutdown => break,
         }
     }
-}
-
-/// Convenience for tests: is `m` legal in `pos`?
-pub fn is_legal(pos: &Position, m: Move) -> bool {
-    legal_moves(pos).contains(&m)
 }

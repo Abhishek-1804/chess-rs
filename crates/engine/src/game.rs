@@ -7,12 +7,18 @@ use crate::types::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GameResult {
-    Checkmate { winner: Color },
-    Resignation { winner: Color },
+    Checkmate {
+        winner: Color,
+    },
+    Resignation {
+        winner: Color,
+    },
     Stalemate,
     FiftyMoveRule,
     ThreefoldRepetition,
     InsufficientMaterial,
+    /// Both players agreed to a draw (offered and accepted).
+    Agreement,
 }
 
 impl GameResult {
@@ -40,6 +46,7 @@ impl GameResult {
             GameResult::FiftyMoveRule => "Draw by the fifty-move rule".into(),
             GameResult::ThreefoldRepetition => "Draw by threefold repetition".into(),
             GameResult::InsufficientMaterial => "Draw by insufficient material".into(),
+            GameResult::Agreement => "Draw by agreement".into(),
         }
     }
 }
@@ -51,6 +58,7 @@ pub struct Game {
     moves: Vec<Move>,
     sans: Vec<String>,
     resigned: Option<Color>,
+    draw_agreed: bool,
 }
 
 impl Default for Game {
@@ -69,7 +77,7 @@ impl Game {
     }
 
     pub fn from_position(pos: Position) -> Self {
-        Game { positions: vec![pos], moves: Vec::new(), sans: Vec::new(), resigned: None }
+        Game { positions: vec![pos], moves: Vec::new(), sans: Vec::new(), resigned: None, draw_agreed: false }
     }
 
     #[inline]
@@ -132,6 +140,7 @@ impl Game {
 
     pub fn undo(&mut self) -> Option<Move> {
         self.resigned = None;
+        self.draw_agreed = false;
         let m = self.moves.pop()?;
         self.sans.pop();
         self.positions.pop();
@@ -141,6 +150,13 @@ impl Game {
     pub fn resign(&mut self, side: Color) {
         if self.result().is_none() {
             self.resigned = Some(side);
+        }
+    }
+
+    /// End the game as a draw by agreement.
+    pub fn agree_draw(&mut self) {
+        if self.result().is_none() {
+            self.draw_agreed = true;
         }
     }
 
@@ -154,6 +170,9 @@ impl Game {
     pub fn result(&self) -> Option<GameResult> {
         if let Some(side) = self.resigned {
             return Some(GameResult::Resignation { winner: side.flip() });
+        }
+        if self.draw_agreed {
+            return Some(GameResult::Agreement);
         }
         let pos = self.position();
         if legal_moves(pos).is_empty() {

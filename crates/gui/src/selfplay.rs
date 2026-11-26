@@ -1,15 +1,16 @@
 //! Headless bot-vs-bot games, saved to the games library (`chess-rs selfplay`).
 //!
 //! A deterministic engine would play the same game every time, so each game
-//! starts with a few random (legal) opening moves before the engines take over.
+//! follows a randomly chosen opening-book line before the engines take over.
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use chess_engine::pgn::{PgnGame, utc_now};
-use chess_engine::{Engine, Game, Limits};
+use chess_engine::{Engine, Game, Limits, book};
 
+use crate::Rng;
 use crate::library::GameLibrary;
 
 /// Safety cap; the fifty-move rule ends real games long before this.
@@ -19,39 +20,24 @@ pub struct SelfPlay {
     pub games: usize,
     pub depth: u32,
     pub threads: usize,
-    /// Random moves played at the start of each game for variety.
-    pub random_plies: usize,
+    /// Seed for choosing the openings.
     pub seed: u64,
 }
 
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        // splitmix64
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
-
 /// Play one game; returns it with PGN tags filled in.
-pub fn play_one(engine: &Engine, depth: u32, random_plies: usize, rng_seed: u64) -> PgnGame {
-    let mut rng = Rng(rng_seed);
+pub fn play_one(engine: &Engine, depth: u32, rng: &mut Rng) -> PgnGame {
     let mut game = Game::new();
     let stop = AtomicBool::new(false);
     engine.clear();
     while game.result().is_none() && game.ply_count() < MAX_PLIES {
-        let legal = game.legal_moves();
-        let m = if game.ply_count() < random_plies {
-            legal[(rng.next() % legal.len() as u64) as usize]
-        } else {
-            let pos = *game.position();
-            let r = engine.search(&pos, &game.history_hashes(), &Limits::depth(depth), &stop, |_| {});
-            r.best_move.unwrap_or(legal[0])
+        let m = match book::pick(&game, rng.next_u64()) {
+            Some(m) => m,
+            None => {
+                let r = engine.search(game.position(), &game.history_hashes(), &Limits::depth(depth), &stop, |_| {});
+                r.best_move.expect("the game is not over, so there is a legal move")
+            }
         };
-        game.play(m).expect("engine and random moves are legal");
+        game.play(m).expect("book and engine moves are legal");
     }
     let mut pgn = PgnGame::from_game(&game);
     let (date, time) = utc_now();
@@ -66,7 +52,6 @@ pub fn play_one(engine: &Engine, depth: u32, random_plies: usize, rng_seed: u64)
         ("Time", time),
         ("Mode", "Bot vs Bot".into()),
         ("BotDepth", depth.to_string()),
-        ("RandomOpeningPlies", random_plies.to_string()),
         ("PlyCount", game.ply_count().to_string()),
         ("Termination", game.result().map_or("move limit reached".into(), |r| r.describe())),
     ] {
@@ -82,9 +67,10 @@ pub fn generate(
     mut on_game: impl FnMut(usize, &PathBuf, &str),
 ) -> io::Result<Vec<PathBuf>> {
     let engine = Engine::new(64, cfg.threads);
+    let mut rng = Rng::new(cfg.seed);
     let mut paths = Vec::with_capacity(cfg.games);
     for i in 0..cfg.games {
-        let pgn = play_one(&engine, cfg.depth, cfg.random_plies, cfg.seed.wrapping_add(i as u64 * 7919));
+        let pgn = play_one(&engine, cfg.depth, &mut rng);
         let path = lib.new_path(&pgn);
         lib.save(&path, &pgn)?;
         let summary = format!(
@@ -108,7 +94,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chess-rs-selfplay-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let lib = GameLibrary::new(&dir);
-        let cfg = SelfPlay { games: 3, depth: 2, threads: 1, random_plies: 4, seed: 42 };
+        let cfg = SelfPlay { games: 3, depth: 2, threads: 1, seed: 42 };
         let mut reported = 0;
         let paths = generate(&lib, &cfg, |_, _, _| reported += 1).unwrap();
         assert_eq!((paths.len(), reported), (3, 3));
@@ -124,7 +110,7 @@ mod tests {
             move_lists.push(pgn.moves);
         }
         move_lists.dedup();
-        assert_eq!(move_lists.len(), 3, "random openings make the games differ");
+        assert_eq!(move_lists.len(), 3, "book openings make the games differ");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

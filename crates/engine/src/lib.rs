@@ -7,6 +7,7 @@
 
 pub mod analysis;
 pub mod attacks;
+pub mod book;
 pub mod cache;
 pub mod endgame;
 pub mod eval;
@@ -18,6 +19,7 @@ pub mod position;
 pub mod psqt;
 pub mod search;
 pub mod see;
+pub mod strength;
 pub mod tt;
 pub mod types;
 pub mod zobrist;

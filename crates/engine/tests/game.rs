@@ -87,6 +87,18 @@ fn resignation_and_undo() {
 }
 
 #[test]
+fn draw_by_agreement() {
+    let mut g = Game::new();
+    play(&mut g, "e4");
+    g.agree_draw();
+    assert_eq!(g.result(), Some(GameResult::Agreement));
+    assert_eq!(g.result().unwrap().pgn(), "1/2-1/2");
+    assert!(g.play(parse_move(g.position(), "e5").unwrap()).is_err());
+    g.undo();
+    assert_eq!(g.result(), None);
+}
+
+#[test]
 fn en_passant_and_castling_through_game() {
     let mut g = Game::new();
     play(&mut g, "e4 Nf6 e5 d5 exd6 exd6 Nf3 Be7 Bc4 O-O O-O");

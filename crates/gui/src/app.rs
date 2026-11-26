@@ -1,8 +1,10 @@
 //! Application state and UI.
 
 mod games_ui;
+mod online_ui;
 mod review_ui;
 
+pub use online_ui::OnlineState;
 pub use review_ui::{ReviewState, class_color};
 
 use std::path::PathBuf;
@@ -19,6 +21,7 @@ use egui::{Color32, Key, RichText, Ui, vec2};
 
 use crate::board::{self, BoardState, BoardView, PROMOTION_CHOICES};
 use crate::library::{GameLibrary, SavedGame};
+use crate::online::{Network, OnlineHandle};
 use crate::pieces::PieceImages;
 use crate::review_worker::ReviewHandle;
 use crate::worker::{EngineConfig, EngineHandle, Purpose, Request, Response, SearchJob};
@@ -30,15 +33,62 @@ pub enum Mode {
     HumanVsBot,
     BotVsBot,
     HumanVsHuman,
+    /// Against another chess-rs player over the internet.
+    Online,
 }
 
 impl Mode {
+    pub const ALL: [Mode; 4] = [Mode::HumanVsBot, Mode::BotVsBot, Mode::HumanVsHuman, Mode::Online];
+
     pub fn label(self) -> &'static str {
         match self {
             Mode::HumanVsBot => "Human vs Bot",
             Mode::BotVsBot => "Bot vs Bot",
             Mode::HumanVsHuman => "Human vs Human",
+            Mode::Online => "Online",
         }
+    }
+
+    /// Parse a `--mode` value.
+    pub fn parse(s: &str) -> Result<Mode, String> {
+        match s.to_lowercase().as_str() {
+            "human-vs-bot" | "hvb" => Ok(Mode::HumanVsBot),
+            "bot-vs-bot" | "bvb" | "selfplay" => Ok(Mode::BotVsBot),
+            "human-vs-human" | "hvh" => Ok(Mode::HumanVsHuman),
+            "online" => Ok(Mode::Online),
+            m => Err(format!("unknown mode '{m}'")),
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Mode::HumanVsBot => "Play against the engine",
+            Mode::BotVsBot => "Watch the engine play itself, from a random opening",
+            Mode::HumanVsHuman => "Two players on this computer",
+            Mode::Online => "Play a friend on another computer: host a game and share its code, or join with one",
+        }
+    }
+}
+
+impl SidePick {
+    /// Parse a `--color` value.
+    pub fn parse(s: &str) -> Result<SidePick, String> {
+        match s.to_lowercase().as_str() {
+            "w" | "white" => Ok(SidePick::White),
+            "b" | "black" => Ok(SidePick::Black),
+            "r" | "random" => Ok(SidePick::Random),
+            c => Err(format!("unknown color '{c}'")),
+        }
+    }
+}
+
+/// The concrete colour for a side choice (random picks either).
+pub fn resolve_side(pick: SidePick) -> Color {
+    match pick {
+        SidePick::White => Color::White,
+        SidePick::Black => Color::Black,
+        SidePick::Random if crate::Rng::from_time().next_u64() & 1 == 0 => Color::White,
+        SidePick::Random => Color::Black,
     }
 }
 
@@ -72,6 +122,8 @@ pub struct AppConfig {
     pub games_dir: Option<PathBuf>,
     /// Search depth for Game Review.
     pub review_depth: u32,
+    /// Network for online games (tests use a local one).
+    pub network: Network,
 }
 
 impl Default for AppConfig {
@@ -87,6 +139,7 @@ impl Default for AppConfig {
             bot_delay: Duration::from_millis(350),
             games_dir: None,
             review_depth: 14,
+            network: Network::Public,
         }
     }
 }
@@ -154,6 +207,19 @@ pub struct ChessApp {
     games_dirty: bool,
     confirm_delete: Option<PathBuf>,
     pgn_input: String,
+
+    ctx: egui::Context,
+    network: Network,
+    online: Option<OnlineHandle>,
+    pub online_state: OnlineState,
+    /// The code typed into the Join box.
+    pub online_code_input: String,
+    pub online_error: Option<String>,
+    pub draw_offered_to_me: bool,
+    pub i_offered_draw: bool,
+    rng: crate::Rng,
+    /// The bot's last move came from the opening book (no search).
+    pub last_from_book: bool,
 }
 
 fn white_relative(score: i32, side: Color) -> i32 {
@@ -167,6 +233,12 @@ pub fn format_score(white_score: i32) -> String {
         Some(n) => format!("#-{}", -n),
         None => format!("{:+.2}", white_score as f64 / 100.0),
     }
+}
+
+/// "≈ 2410 Elo" for a depth, marked when extrapolated rather than measured.
+pub fn strength_label(depth: u32) -> String {
+    let s = chess_engine::strength::estimated_elo(depth);
+    if s.measured { format!("≈ {} Elo", s.elo) } else { format!("≈ {} Elo (estimated)", s.elo) }
 }
 
 /// 12345678 -> "12,345,678"
@@ -254,6 +326,16 @@ impl ChessApp {
             games_dirty: true,
             confirm_delete: None,
             pgn_input: String::new(),
+            ctx: ctx.clone(),
+            network: cfg.network,
+            online: None,
+            online_state: OnlineState::Idle,
+            online_code_input: String::new(),
+            online_error: None,
+            draw_offered_to_me: false,
+            i_offered_draw: false,
+            rng: crate::Rng::from_time(),
+            last_from_book: false,
         };
         app.new_game();
         if let Some(fen) = cfg.fen
@@ -270,7 +352,7 @@ impl ChessApp {
         match self.mode {
             Mode::HumanVsBot => c != self.human,
             Mode::BotVsBot => true,
-            Mode::HumanVsHuman => false,
+            Mode::HumanVsHuman | Mode::Online => false,
         }
     }
 
@@ -288,12 +370,20 @@ impl ChessApp {
     }
 
     fn human_to_move(&self) -> bool {
+        if self.mode == Mode::Online {
+            return self.online_state == OnlineState::Playing
+                && self.game.side_to_move() == self.human
+                && self.game.result().is_none();
+        }
         !self.is_bot(self.game.side_to_move()) && self.game.result().is_none()
     }
 
     pub fn status_text(&self) -> String {
         if let Some(r) = self.game.result() {
             return r.describe();
+        }
+        if self.mode == Mode::Online {
+            return self.online_status();
         }
         let side = self.game.side_to_move();
         if self.is_thinking() {
@@ -347,7 +437,7 @@ impl ChessApp {
     }
 
     pub fn request_hint(&mut self) {
-        if self.human_to_move() && !self.is_reviewing() {
+        if self.mode != Mode::Online && self.human_to_move() && !self.is_reviewing() {
             self.hint = None;
             self.start_search(Purpose::Hint);
         }
@@ -381,6 +471,7 @@ impl ChessApp {
                     }
                     let side = self.game.side_to_move();
                     self.thinking = None;
+                    self.last_from_book = false;
                     self.eval_white = Some(white_relative(result.score, side));
                     self.last_search = Some(LastSearch { result: result.clone(), from_cache, ply: j.ply, purpose });
                     match (purpose, result.best_move) {
@@ -417,6 +508,7 @@ impl ChessApp {
     pub fn tick(&mut self) {
         self.poll_engine();
         self.poll_review();
+        self.poll_online();
         if let Some((m, ready)) = self.pending_bot_move
             && Instant::now() >= ready
         {
@@ -432,7 +524,14 @@ impl ChessApp {
             && self.promotion.is_none()
             && !(self.mode == Mode::BotVsBot && self.paused);
         if wants_bot {
-            self.start_search(Purpose::BotMove);
+            // Bots open from a random book line, so their games differ.
+            match self.book_move() {
+                Some(m) => {
+                    self.pending_bot_move = Some((m, Instant::now() + self.bot_delay));
+                    self.last_from_book = true;
+                }
+                None => self.start_search(Purpose::BotMove),
+            }
         }
         if self.game.result().is_some() && !self.saved_this_game {
             self.saved_this_game = true;
@@ -440,16 +539,34 @@ impl ChessApp {
         }
     }
 
+    /// A random opening-book move for the bot, in Bot vs Bot games.
+    fn book_move(&mut self) -> Option<Move> {
+        if self.mode != Mode::BotVsBot {
+            return None;
+        }
+        chess_engine::book::pick(&self.game, self.rng.next_u64())
+    }
+
     // ------------------------------------------------------------ game actions
 
     pub fn play_move(&mut self, m: Move) {
+        let ply = self.game.ply_count();
+        let mover = self.game.side_to_move();
         if self.game.play(m).is_ok() {
-            self.hint = None;
-            self.board.selected = None;
-            self.view_ply = None;
-            self.message = None;
-            self.autosave();
+            if self.mode == Mode::Online && mover == self.human {
+                self.send_online_move(ply, m.to_uci());
+            }
+            self.after_move();
         }
+    }
+
+    /// Bookkeeping after any move lands on the board.
+    fn after_move(&mut self) {
+        self.hint = None;
+        self.board.selected = None;
+        self.view_ply = None;
+        self.message = None;
+        self.autosave();
     }
 
     /// The user dropped/clicked a piece from `from` to `to`.
@@ -476,6 +593,9 @@ impl ChessApp {
     }
 
     pub fn undo(&mut self) {
+        if self.mode == Mode::Online {
+            return; // no take-backs against a real opponent
+        }
         self.cancel_job();
         self.promotion = None;
         self.hint = None;
@@ -493,7 +613,7 @@ impl ChessApp {
                 self.paused = true;
                 self.game.undo();
             }
-            Mode::HumanVsHuman => {
+            Mode::HumanVsHuman | Mode::Online => {
                 self.game.undo();
             }
         }
@@ -503,31 +623,44 @@ impl ChessApp {
 
     pub fn resign(&mut self) {
         if self.game.result().is_none() {
+            if self.mode == Mode::Online {
+                if self.online_state != OnlineState::Playing {
+                    return;
+                }
+                if let Some(net) = &self.online {
+                    net.send(crate::online::NetCmd::Resign);
+                }
+            }
             self.cancel_job();
-            let side = if self.mode == Mode::HumanVsBot { self.human } else { self.game.side_to_move() };
+            let side = if matches!(self.mode, Mode::HumanVsBot | Mode::Online) {
+                self.human
+            } else {
+                self.game.side_to_move()
+            };
             self.game.resign(side);
             self.autosave();
         }
     }
 
     pub fn new_game(&mut self) {
+        self.leave_online();
+        let game = match &self.start_fen {
+            Some(f) => Game::from_fen(f).unwrap_or_default(),
+            None => Game::new(),
+        };
+        self.begin_game(game, resolve_side(self.side_pick));
+    }
+
+    /// Start `game` with the human playing `human`.
+    fn begin_game(&mut self, game: Game, human: Color) {
         self.cancel_job();
         if self.game.ply_count() > 0 && !self.saved_this_game {
             self.save_cache();
         }
-        self.game = match &self.start_fen {
-            Some(f) => Game::from_fen(f).unwrap_or_default(),
-            None => Game::new(),
-        };
-        self.human = match self.side_pick {
-            SidePick::White => Color::White,
-            SidePick::Black => Color::Black,
-            SidePick::Random => {
-                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                if t.subsec_nanos() & 1 == 0 { Color::White } else { Color::Black }
-            }
-        };
-        self.board.flipped = self.mode == Mode::HumanVsBot && self.human == Color::Black;
+        self.game = game;
+        self.human = human;
+        self.last_from_book = false;
+        self.board.flipped = matches!(self.mode, Mode::HumanVsBot | Mode::Online) && self.human == Color::Black;
         self.board.selected = None;
         self.promotion = None;
         self.view_ply = None;
@@ -550,6 +683,7 @@ impl ChessApp {
             Mode::HumanVsBot => (bot, human),
             Mode::BotVsBot => (bot.clone(), bot),
             Mode::HumanVsHuman => (human.clone(), human),
+            Mode::Online => online_ui::online_names(self.human),
         }
     }
 
@@ -559,7 +693,7 @@ impl ChessApp {
         let (date, time) = utc_now();
         let (white, black) = self.player_names();
         self.record_tags = vec![
-            ("Event".into(), "chess-rs game".into()),
+            ("Event".into(), if self.mode == Mode::Online { "chess-rs online game" } else { "chess-rs game" }.into()),
             ("Site".into(), "chess-rs".into()),
             ("Date".into(), date),
             ("Round".into(), "-".into()),
@@ -574,7 +708,7 @@ impl ChessApp {
     pub fn current_pgn(&self) -> PgnGame {
         let mut pgn = PgnGame::from_game(&self.game);
         pgn.tags = self.record_tags.clone();
-        if self.mode != Mode::HumanVsHuman {
+        if matches!(self.mode, Mode::HumanVsBot | Mode::BotVsBot) {
             pgn.set_tag("BotDepth", self.depth.to_string());
         }
         pgn.set_tag("PlyCount", self.game.ply_count().to_string());
@@ -616,6 +750,12 @@ impl ChessApp {
     }
 
     pub fn set_mode(&mut self, m: Mode) {
+        if self.mode == Mode::Online && m != Mode::Online {
+            self.leave_online();
+        }
+        if m == Mode::Online {
+            self.cancel_job();
+        }
         self.mode = m;
     }
 
@@ -652,7 +792,7 @@ impl ChessApp {
         if hint {
             self.request_hint();
         }
-        if new {
+        if new && !self.online_active() {
             self.new_game();
         }
         let n = self.game.ply_count();
@@ -861,9 +1001,18 @@ impl ChessApp {
             ui.visuals().strong_text_color()
         };
         ui.label(RichText::new(self.status_text()).size(16.0).color(status_color));
-        if let (Some(n), Some(job)) = (self.live_positions(), &self.job) {
-            let secs = job.started.elapsed().as_secs_f64();
-            let what = if job.purpose == Purpose::Hint { "Hint: positions searched" } else { "Positions searched" };
+        // Always two lines (live while searching, else the last search), so the
+        // panel doesn't jump as searches start and stop.
+        if self.mode != Mode::Online {
+            let (what, n, secs) = match (self.live_positions(), &self.job, &self.last_search) {
+                (Some(n), Some(job), _) => {
+                    let what =
+                        if job.purpose == Purpose::Hint { "Hint: positions searched" } else { "Positions searched" };
+                    (what, n, job.started.elapsed().as_secs_f64())
+                }
+                (_, _, Some(l)) => ("Last search", l.result.nodes, l.result.time.as_secs_f64()),
+                _ => ("Positions searched", 0, 0.0),
+            };
             ui.label(RichText::new(format!("{what}: {}", with_commas(n))).size(18.0).strong().monospace());
             ui.label(
                 RichText::new(format!("{}/s · {:.1}s", with_commas((n as f64 / secs.max(1e-3)) as u64), secs))
@@ -878,11 +1027,24 @@ impl ChessApp {
 
         // ---- new game ----
         ui.label(RichText::new("Game setup").strong());
-        egui::ComboBox::from_label("Mode").selected_text(self.mode.label()).show_ui(ui, |ui| {
-            for m in [Mode::HumanVsBot, Mode::BotVsBot, Mode::HumanVsHuman] {
-                ui.selectable_value(&mut self.mode, m, m.label());
+        let mut mode = self.mode;
+        ui.horizontal_wrapped(|ui| {
+            for m in Mode::ALL {
+                ui.selectable_value(&mut mode, m, m.label()).on_hover_text(m.description());
             }
         });
+        if mode != self.mode {
+            self.set_mode(mode);
+        }
+        if self.mode == Mode::Online {
+            self.online_panel(ui);
+            ui.separator();
+            ui.label(RichText::new("Moves").strong());
+            self.move_list(ui);
+            ui.separator();
+            self.position_section(ui);
+            return;
+        }
         if self.mode == Mode::HumanVsBot {
             ui.horizontal(|ui| {
                 ui.label("Play as");
@@ -908,6 +1070,10 @@ impl ChessApp {
         // ---- strength ----
         ui.label(RichText::new("Bot").strong());
         ui.add(egui::Slider::new(&mut self.depth, 1..=MAX_DEPTH).text("depth (plies)"));
+        ui.label(RichText::new(strength_label(self.depth)).strong()).on_hover_text(
+            "Estimated rating at this depth, from games against Stockfish at calibrated strengths \
+             (CCRL scale; a rough guide to human ratings). Deeper depths are extrapolated.",
+        );
         let max_threads = default_threads().max(self.threads);
         ui.add(egui::Slider::new(&mut self.threads, 1..=max_threads).text("threads"));
         if self.depth >= 22 {
@@ -948,6 +1114,7 @@ impl ChessApp {
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_legal, "Show legal moves");
+            ui.checkbox(&mut self.board.animate, "Animate moves");
         });
         ui.separator();
 
@@ -961,34 +1128,7 @@ impl ChessApp {
         self.move_list(ui);
         ui.separator();
 
-        egui::CollapsingHeader::new("Position (FEN / PGN)").default_open(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Copy FEN").clicked() {
-                    ui.ctx().copy_text(self.game.position().to_fen());
-                    self.message = Some("FEN copied to clipboard".into());
-                }
-                if ui.button("Copy PGN").clicked() {
-                    let (w, b) = match self.mode {
-                        Mode::HumanVsBot if self.human == Color::White => ("Human", "chess-rs"),
-                        Mode::HumanVsBot => ("chess-rs", "Human"),
-                        Mode::BotVsBot => ("chess-rs", "chess-rs"),
-                        Mode::HumanVsHuman => ("Human", "Human"),
-                    };
-                    ui.ctx().copy_text(self.game.to_pgn(w, b));
-                    self.message = Some("PGN copied to clipboard".into());
-                }
-            });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.fen_input).hint_text("Paste a FEN…").desired_width(f32::INFINITY),
-            );
-            if ui.button("Load FEN").clicked() {
-                let fen = self.fen_input.clone();
-                match self.load_fen(&fen) {
-                    Ok(()) => self.message = Some("Position loaded".into()),
-                    Err(e) => self.message = Some(format!("Invalid FEN: {e}")),
-                }
-            }
-        });
+        self.position_section(ui);
 
         egui::CollapsingHeader::new("Position cache").default_open(true).show(ui, |ui| {
             let s = self.cache_stats;
@@ -1023,7 +1163,37 @@ impl ChessApp {
         });
     }
 
+    fn position_section(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new("Position (FEN / PGN)").default_open(false).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Copy FEN").clicked() {
+                    ui.ctx().copy_text(self.game.position().to_fen());
+                    self.message = Some("FEN copied to clipboard".into());
+                }
+                if ui.button("Copy PGN").clicked() {
+                    ui.ctx().copy_text(self.current_pgn().to_pgn());
+                    self.message = Some("PGN copied to clipboard".into());
+                }
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.fen_input).hint_text("Paste a FEN…").desired_width(f32::INFINITY),
+            );
+            // An online game's position is fixed once hosted or joined.
+            if ui.add_enabled(!self.online_active(), egui::Button::new("Load FEN")).clicked() {
+                let fen = self.fen_input.clone();
+                match self.load_fen(&fen) {
+                    Ok(()) => self.message = Some("Position loaded".into()),
+                    Err(e) => self.message = Some(format!("Invalid FEN: {e}")),
+                }
+            }
+        });
+    }
+
     fn engine_info(&self, ui: &mut Ui) {
+        if self.last_from_book && self.thinking.is_none() {
+            ui.label(RichText::new("Opening book move (no search)").weak());
+            return;
+        }
         let base_ply = self.job.as_ref().map(|j| j.ply).or(self.last_search.as_ref().map(|l| l.ply));
         let base = base_ply.map(|p| *self.game.position_at(p));
         let (depth, seldepth, score, nodes, nps, time, pv, source, hashfull) = if let Some(i) = &self.thinking {
@@ -1126,6 +1296,9 @@ impl ChessApp {
 
     /// Stop the engine thread, persisting the cache.
     pub fn shutdown(&mut self) {
+        if let Some(mut net) = self.online.take() {
+            net.shutdown();
+        }
         self.cancel_job();
         self.engine.shutdown();
     }

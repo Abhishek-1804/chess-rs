@@ -20,6 +20,22 @@ run = "cargo run --release -p chess-rs --"
 description = "Watch the bot play itself"
 run = "cargo run --release -p chess-rs -- --mode bot-vs-bot"
 
+[tasks.online]
+description = "Play online from the terminal: `mise run online -- host` (prints a code) or `mise run online -- join <CODE>`"
+run = "cargo run -q --release -p chess-rs -- online"
+
+[tasks."test:online"]
+description = "Play a full game between two in-process players over the real internet (needs network)"
+run = "cargo test --release -p chess-rs --test online -- --ignored"
+
+[tasks.elo]
+description = "List the bot's estimated Elo at every depth"
+run = "cargo run -q --release -p chess-rs -- --elo"
+
+[tasks."elo:calibrate"]
+description = "Re-measure Elo per depth against Stockfish (about 1h on 16 cores), e.g. `mise run elo:calibrate -- --stockfish /path/to/stockfish --depths 1-12`"
+run = "cargo run -q --release -p chess-engine --example elo --"
+
 [tasks.help]
 description = "Show all game options"
 run = "cargo run --release -p chess-rs -- --help"

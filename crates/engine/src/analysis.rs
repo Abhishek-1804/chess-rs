@@ -96,10 +96,6 @@ impl MoveClass {
         }
     }
 
-    pub fn from_label(s: &str) -> Option<MoveClass> {
-        MoveClass::ALL.into_iter().find(|c| c.label().eq_ignore_ascii_case(s))
-    }
-
     /// Bad moves (shown with an explanation of what was better).
     pub fn is_error(self) -> bool {
         matches!(self, MoveClass::Inaccuracy | MoveClass::Mistake | MoveClass::Miss | MoveClass::Blunder)

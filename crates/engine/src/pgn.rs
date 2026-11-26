@@ -79,10 +79,6 @@ impl PgnGame {
         }
     }
 
-    pub fn remove_tag(&mut self, key: &str) {
-        self.tags.retain(|(k, _)| k != key);
-    }
-
     /// Serialise as PGN text (one game, trailing newline).
     pub fn to_pgn(&self) -> String {
         let mut out = String::new();

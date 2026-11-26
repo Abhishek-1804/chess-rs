@@ -1,7 +1,6 @@
 //! chess-rs: play chess against a fast engine.
 
 use std::process::ExitCode;
-use std::time::Duration;
 
 use chess_rs::library::GameLibrary;
 use chess_rs::selfplay::{SelfPlay, generate};
@@ -13,11 +12,17 @@ chess-rs — play chess against a multi-threaded alpha-beta engine
 USAGE:
   chess-rs [OPTIONS]                 open the game
   chess-rs selfplay [SELFPLAY OPTS]  play bot-vs-bot games headlessly into the games folder
+  chess-rs online host|join ...      play someone over the internet from the terminal
+                                     (chess-rs online --help for details)
 
 OPTIONS:
   -d, --depth <N>      Bot search depth in plies (1-40)            [default: 12]
+                       Strength: depth 1 ≈ 1300 Elo, 4 ≈ 1650, 6 ≈ 2000, 8 ≈ 2400,
+                       12 ≈ 2750
+                       (chess-rs --elo lists every depth)
   -c, --color <C>      Your side: white | black | random           [default: white]
-  -m, --mode <M>       human-vs-bot | bot-vs-bot | human-vs-human  [default: human-vs-bot]
+  -m, --mode <M>       human-vs-bot | bot-vs-bot | human-vs-human | online
+                                                                   [default: human-vs-bot]
   -t, --threads <N>    Search threads                              [default: all cores]
       --hash <MB>      Transposition table size in MiB             [default: 1024]
       --fen <FEN>      Start from a custom position
@@ -26,12 +31,12 @@ OPTIONS:
       --games-dir <P>  Where games are saved                   [default: <project>/games]
       --no-games       Do not save games
       --review-depth <N>  Search depth for Game Review (1-40)   [default: 14]
+      --elo            List the estimated Elo of every depth
   -h, --help           Show this help
 
 SELFPLAY OPTS:
       --games <N>      Number of games                             [default: 6]
   -d, --depth <N>      Search depth for both sides                 [default: 4]
-      --random <N>     Random opening plies, for variety           [default: 4]
   -t, --threads <N>    Search threads                              [default: all cores]
       --games-dir <P>  Output folder                   [default: <project>/games]
 ";
@@ -59,22 +64,8 @@ fn parse_args() -> Result<AppConfig, String> {
                     return Err(format!("depth must be between 1 and {}", chess_rs::app::MAX_DEPTH));
                 }
             }
-            "-c" | "--color" => {
-                cfg.side = match val("--color")?.to_lowercase().as_str() {
-                    "w" | "white" => SidePick::White,
-                    "b" | "black" => SidePick::Black,
-                    "r" | "random" => SidePick::Random,
-                    c => return Err(format!("unknown color '{c}'")),
-                }
-            }
-            "-m" | "--mode" => {
-                cfg.mode = match val("--mode")?.to_lowercase().as_str() {
-                    "human-vs-bot" | "hvb" => Mode::HumanVsBot,
-                    "bot-vs-bot" | "bvb" | "selfplay" => Mode::BotVsBot,
-                    "human-vs-human" | "hvh" => Mode::HumanVsHuman,
-                    m => return Err(format!("unknown mode '{m}'")),
-                }
-            }
+            "-c" | "--color" => cfg.side = SidePick::parse(&val("--color")?)?,
+            "-m" | "--mode" => cfg.mode = Mode::parse(&val("--mode")?)?,
             "-t" | "--threads" => cfg.threads = val("--threads")?.parse().map_err(|_| "threads must be a number")?,
             "--hash" => cfg.hash_mb = val("--hash")?.parse().map_err(|_| "hash must be a number (MiB)")?,
             "--fen" => cfg.fen = Some(val("--fen")?),
@@ -99,8 +90,7 @@ fn selfplay(args: &[String]) -> Result<(), String> {
         games: 6,
         depth: 4,
         threads: chess_engine::default_threads(),
-        random_plies: 4,
-        seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64),
+        seed: chess_rs::Rng::from_time().next_u64(),
     };
     let mut dir = default_games_dir();
     let mut it = args.iter();
@@ -111,7 +101,6 @@ fn selfplay(args: &[String]) -> Result<(), String> {
         match a.as_str() {
             "--games" => cfg.games = num("--games")? as usize,
             "-d" | "--depth" => cfg.depth = num("--depth")?.clamp(1, 40) as u32,
-            "--random" => cfg.random_plies = num("--random")? as usize,
             "-t" | "--threads" => cfg.threads = num("--threads")?.max(1) as usize,
             "--games-dir" => dir = it.next().ok_or("--games-dir needs a value")?.into(),
             "-h" | "--help" => {
@@ -133,6 +122,24 @@ fn selfplay(args: &[String]) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--elo") {
+        use std::io::Write;
+        let mut out = String::from("depth  estimated Elo\n");
+        for d in 1..=chess_rs::app::MAX_DEPTH {
+            out += &format!("{d:>5}  {}\n", chess_rs::app::strength_label(d).trim_start_matches("≈ "));
+        }
+        let _ = std::io::stdout().write_all(out.as_bytes()); // ignore a closed pipe (| head)
+        return ExitCode::SUCCESS;
+    }
+    if args.first().map(String::as_str) == Some("online") {
+        return match chess_rs::online_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().map(String::as_str) == Some("selfplay") {
         return match selfplay(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -149,7 +156,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cfg = AppConfig { bot_delay: Duration::from_millis(350), ..cfg };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("chess-rs")

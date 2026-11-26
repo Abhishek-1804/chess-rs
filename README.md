@@ -23,13 +23,75 @@ mise run play       # play!
 ### Playing
 
 - **Move**: click a piece, then click a destination, or drag and drop. Legal moves show as dots and capture targets as rings.
+  Moves slide into place (turn this off with *Animate moves*).
 - **Promotion**: a picker lets you choose queen, rook, bishop or knight.
 - **Bot strength**: set the *depth* slider (1–40 plies) and the *threads* slider (defaults to all CPU cores).
+  The estimated Elo for the chosen depth shows under the slider (see [How strong is the bot?](#how-strong-is-the-bot)).
   Depth 10–14 replies almost instantly. Above about 20, use **Move now** to cut a long think short.
 - **While the bot thinks**, the side panel shows a live count of the positions it has searched, plus positions per second and elapsed time.
 - **Other controls**: Undo, Hint (shows a blue arrow), Flip board, Resign, move list with history review,
   Copy FEN/PGN, Load FEN.
-- **Modes**: Human vs Bot, Bot vs Bot (watch it play itself), Human vs Human.
+- **Modes** (buttons at the top of the side panel): Human vs Bot, Bot vs Bot (watch it play
+  itself; each game opens with a random line from a built-in opening book, so games differ),
+  Human vs Human, and Online (against a friend on another computer, see below).
+
+### How strong is the bot?
+
+Estimated Elo per depth, measured by playing the engine against Stockfish 19 at calibrated
+strength levels (`UCI_Elo`, anchored to the CCRL 40/4 rating list). Each depth played 108
+games from 27 balanced openings, each with both colours; the standard error is about ±35.
+(`elo:calibrate` now draws its openings from the full opening book.)
+
+| Depth | Elo | | Depth | Elo |
+|---|---|---|---|---|
+| 1 | 1301 | | 7 | 2235 |
+| 2 | 1451 | | 8 | 2410 |
+| 3 | 1551 | | 9 | 2529 |
+| 4 | 1660 | | 10 | 2580 |
+| 5 | 1797 | | 11 | 2706 |
+| 6 | 1985 | | 12 | 2761 |
+
+Beyond depth 12 (the default) the numbers are extrapolated, with each extra ply worth a little
+less than the one before: about 2870 at depth 14, 2940 at 16, 3005 at 19 and 3070 at 40.
+
+CCRL is an engine rating scale, so treat these as a rough guide to human ratings. The
+measurements used one search thread; the app's default of all cores is a little stronger at the
+same depth. `mise run elo` lists every depth, and `mise run elo:calibrate` repeats the
+measurement (it needs a Stockfish binary: `--stockfish <PATH>`).
+
+### Playing online
+
+Play someone on another computer, over the internet, with a short code. No account, server
+or port forwarding needed.
+
+1. One player clicks the **Online** mode button, chooses a side, and clicks **Host game**. The app
+   shows a code such as `K7QM-X2PA`. Send it to your opponent.
+2. The other player clicks **Online** too, types the code under **Join a game** (case and
+   dashes don't matter), and clicks **Join**.
+3. Both apps connect and the game starts, usually within a few seconds. The host's chosen side
+   decides the colours; Black sees the board from their side.
+
+During the game you can **Offer draw** (the opponent accepts or declines), **Resign**, or
+**Leave**. There are no take-backs or hints. Online games are saved in `games/` like any
+other, so you can review them afterwards.
+
+You can also play from the terminal, against the app or another terminal:
+
+```sh
+mise run online -- host                  # prints a code; --color white|black|random, --fen <FEN>
+mise run online -- join K7QM-X2PA
+```
+
+Type moves (`e4`, `Nf3`, `O-O`, `e7e8q`) or `draw`, `decline`, `resign`, `board`, `quit`.
+Moves typed before your turn are queued as premoves, so you can also pipe a game in.
+
+**How it works:** the two apps connect peer to peer with [iroh](https://www.iroh.computer)
+(QUIC with hole-punching), falling back to a free public relay when a direct connection isn't
+possible. There is no chess-rs server: the host's network identity (an ed25519 key) is derived
+from the code, so the code alone is enough for the joiner to look the host up through n0's
+public address-lookup service. The traffic is end-to-end encrypted. Anyone who knows a code
+can join that game until it starts, so share it only with your opponent; a game that has
+started turns away everyone else.
 
 ### Saved games
 
@@ -45,7 +107,7 @@ mise run games:generate                          # 6 games at depth 4
 mise run games:generate -- --games 10 --depth 6
 ```
 
-Each self-play game starts with a few random opening moves so the games differ.
+Each self-play game opens with a random line from the opening book, so the games differ.
 
 ### Game Review (like chess.com)
 
@@ -109,10 +171,14 @@ Openings repeat a lot, so the bot gets faster the more you play. The cache:
 |---|---|
 | `mise run play` | Launch the game (GUI) |
 | `mise run watch` | Bot vs bot |
+| `mise run online -- host` / `mise run online -- join <CODE>` | Play online from the terminal |
+| `mise run elo` | Estimated Elo of every depth |
+| `mise run elo:calibrate -- --stockfish <PATH>` | Re-measure Elo per depth against Stockfish (about an hour on 16 cores) |
 | `mise run test` | Full test suite: engine, published suites, headless GUI end-to-end |
 | `mise run test:engine` | Engine tests only |
 | `mise run test:gui` | GUI tests; screenshots land in `target/tmp/ui-screenshots/` |
 | `mise run test:deep` | Deep perft validation (tens of billions of nodes) |
+| `mise run test:online` | A full game between two players over the real internet (needs network access) |
 | `mise run ci` | Format check + clippy (warnings are errors) + tests |
 | `mise run review -- game.pgn` | Review PGN games in the terminal (see [Command-line tool](#command-line-tool-chess-cli)) |
 | `mise run cli -- help` | Any `chess-cli` command; `help` prints the full reference |
@@ -129,7 +195,8 @@ Openings repeat a lot, so the bot gets faster the more you play. The cache:
 Two crates in one Cargo workspace:
 
 - **`crates/engine`** (`chess-engine`): the engine itself, with zero dependencies.
-- **`crates/gui`** (`chess-rs`): the desktop app, built on [egui/eframe](https://github.com/emilk/egui).
+- **`crates/gui`** (`chess-rs`): the desktop app, built on [egui/eframe](https://github.com/emilk/egui),
+  with online play over [iroh](https://www.iroh.computer) (`src/online.rs`).
 
 ### Engine
 
@@ -166,6 +233,9 @@ Two crates in one Cargo workspace:
 
 - The engine runs on its own thread. The UI sends search jobs over a channel, and each job carries
   its own cancellation flag, so the window never blocks.
+- Online play runs on a networking thread of its own. The two apps exchange one line of text per
+  event (`MOVE 4 g1f3`, `RESIGN`, `DRAW?`, …), and each app checks every incoming move against
+  its own board, so a buggy or modified opponent can't put an illegal move on your board.
 - Pieces are original vector art (SVG), rasterised by resvg at the exact display size.
 
 ### Performance (16-thread desktop)
@@ -194,12 +264,14 @@ programming community; see `crates/engine/tests/data/SOURCES.md` for where each 
 | Tactics | Regression gates on Win At Chess (257/300 at depth 9) and Bratko-Kopec. |
 | Soundness | Pruned search must agree with plain alpha-beta on forced mates. Each pruning technique can be switched off, and the engine must still work. |
 | Invariants | Incremental hash and evaluation equal a from-scratch recomputation; the evaluation is colour-symmetric; FEN and SAN round-trip; magic lookups match slow reference attacks. |
-| Rules | Fool's mate, stalemate, threefold repetition, fifty-move rule, insufficient material, undo, PGN export. |
+| Opening book & strength | Every book line is legal and distinct, book moves follow the game and stop when it leaves the book, and Elo estimates never drop as depth rises. |
+| Rules | Fool's mate, stalemate, threefold repetition, fifty-move rule, insufficient material, draw by agreement, undo, PGN export. |
+| Online | Two players in one process over loopback with the real iroh transport: a game to checkmate, either side hosting, resign, draw offers, leaving, a third player turned away, a wrong code cancelled cleanly, and out-of-order or illegal moves rejected. Codes are case- and dash-insensitive and typos are explained. `test:online` plays the same game through the public internet. |
 | PGN | Reads real-world PGN (comments, variations, NAGs, `0-0`, custom FEN starts). Anderssen's *Immortal Game* and Morphy's *Opera Game* must parse and end in checkmate, and writing them back out must be byte-identical. |
 | Game Review | lichess win-% and accuracy formulas, every rating band, Forced/Great/Brilliant/Miss detection, the Opera Game review (Morphy's accuracy beats his opponent's), and reviews surviving a round trip through PGN. |
 | GUI end-to-end | The real app driven headlessly (egui_kittest): clicking, dragging, en passant, castling, promotion picker, checkmate, undo, hint, keyboard shortcuts, Move now, the live positions counter, cache reuse and persistence across restarts, games autosaved and updated on undo/resign,
 the Games tab (list, review, delete with confirmation), Game Review (rates fool's mate's `2.g4`
-as a blunder, accuracy cards, eval-graph clicks), and reviewing pasted PGN. It also renders screenshots. |
+as a blunder, accuracy cards, eval-graph clicks), reviewing pasted PGN, two apps playing each other online (hosting, joining by typed code, moves, draw offers, resigning, leaving, the saved PGN), move animations (clicked moves slide, dropped pieces don't, castling slides king and rook), Bot vs Bot opening variety, and every mode being a visible button. It also renders screenshots. |
 
 As a sanity check that the suite catches real bugs, these were injected one at a time; each one made
 between 3 and 14 tests fail:

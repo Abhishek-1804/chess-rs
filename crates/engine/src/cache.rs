@@ -159,10 +159,6 @@ impl PositionCache {
         }
     }
 
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
     pub fn clear(&mut self) {
         self.roots.clear();
         self.tt_entries.clear();

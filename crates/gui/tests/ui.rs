@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use chess_engine::types::parse_sq;
 use chess_engine::{Color, GameResult, PieceType, Position};
+use chess_rs::app::OnlineState;
+use chess_rs::online::Network;
 use chess_rs::worker::Purpose;
 use chess_rs::{AppConfig, ChessApp, Mode, SidePick};
 use egui_kittest::Harness;
@@ -26,6 +28,7 @@ fn cfg() -> AppConfig {
         bot_delay: Duration::ZERO,
         games_dir: None,
         review_depth: 5,
+        network: Network::local(),
     }
 }
 
@@ -486,7 +489,7 @@ fn games_tab_lists_reviews_and_deletes() {
     let dir = temp_games_dir("tab");
     // Seed the folder with two self-play games.
     let lib = chess_rs::library::GameLibrary::new(&dir);
-    let sp = chess_rs::selfplay::SelfPlay { games: 2, depth: 2, threads: 1, random_plies: 4, seed: 7 };
+    let sp = chess_rs::selfplay::SelfPlay { games: 2, depth: 2, threads: 1, seed: 7 };
     chess_rs::selfplay::generate(&lib, &sp, |_, _, _| {}).unwrap();
 
     let mut h = harness_with(AppConfig { games_dir: Some(dir.clone()), review_depth: 3, ..cfg() }, true);
@@ -552,4 +555,206 @@ fn review_a_pasted_pgn() {
     assert!(app(&h).review.as_ref().unwrap().is_running());
     click_button(&mut h, "Stop analysis");
     assert!(!app(&h).review.as_ref().unwrap().is_running());
+}
+
+// ---------------------------------------------------------------- online
+
+/// Step two apps until `cond` holds (their network threads run in real time).
+fn wait_both(a: &mut H, b: &mut H, what: &str, cond: impl Fn(&ChessApp, &ChessApp) -> bool) {
+    let t = Instant::now();
+    while !cond(app(a), app(b)) {
+        assert!(t.elapsed() < Duration::from_secs(30), "timed out waiting for: {what}");
+        a.step();
+        b.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Two apps on one in-process network: `host` hosts (playing `side`), and
+/// `guest` joins by typing the code. Returns once both are playing.
+fn online_pair(side: SidePick, render: bool) -> (H, H) {
+    let network = Network::local();
+    let online = AppConfig { mode: Mode::Online, network, ..cfg() };
+    let mut host = harness_with(AppConfig { side, ..online.clone() }, render);
+    let mut guest = harness_with(online, render);
+    assert!(app(&host).status_text().contains("host a game"), "{}", app(&host).status_text());
+    click_button(&mut host, "Host game");
+    assert_eq!(app(&host).online_state, OnlineState::Hosting);
+    assert_eq!(app(&host).status_text(), "Waiting for your opponent to join…");
+    let code = app(&host).online_code().unwrap();
+    if render {
+        for _ in 0..4 {
+            host.step();
+        }
+        host.render().unwrap().save(shots_dir().join("06-online-hosting.png")).unwrap();
+    }
+    // A typo is explained, not sent.
+    app_mut(&mut guest).online_code_input = "K7QM-X2P0".into();
+    click_button(&mut guest, "Join");
+    assert!(app(&guest).online_error.as_ref().is_some_and(|e| e.contains("'0'")));
+    assert_eq!(app(&guest).online_state, OnlineState::Idle);
+    // Codes are case- and dash-insensitive.
+    app_mut(&mut guest).online_code_input = code.to_lowercase().replace('-', "");
+    click_button(&mut guest, "Join");
+    wait_both(&mut host, &mut guest, "both connected", |h, g| {
+        h.online_state == OnlineState::Playing && g.online_state == OnlineState::Playing
+    });
+    assert_eq!(app(&guest).online_code_input, code);
+    assert_ne!(app(&host).human, app(&guest).human);
+    (host, guest)
+}
+
+#[test]
+fn online_game_between_two_apps() {
+    let (mut white, mut black) = online_pair(SidePick::White, true);
+    assert_eq!(app(&white).human, Color::White);
+    assert!(app(&black).board.flipped, "Black sees the board from their side");
+    assert!(app(&black).status_text().starts_with("Opponent's move"));
+
+    // Black can't move on White's turn, and nobody gets hints or take-backs.
+    drag_piece(&mut black, "e7", "e5");
+    assert_eq!(app(&black).game.ply_count(), 0);
+    app_mut(&mut white).request_hint();
+    assert!(app(&white).hint.is_none() && app(&white).last_search.is_none());
+
+    let moves = [("e2", "e4"), ("e7", "e5"), ("f1", "c4"), ("b8", "c6"), ("d1", "h5"), ("g8", "f6")];
+    for (i, (from, to)) in moves.iter().enumerate() {
+        let (mover, other) = if i % 2 == 0 { (&mut white, &mut black) } else { (&mut black, &mut white) };
+        drag_piece(mover, from, to);
+        assert_eq!(app(mover).game.ply_count(), i + 1, "{from}-{to} was not played");
+        wait_both(mover, other, "move to arrive", |_, o| o.game.ply_count() == i + 1);
+    }
+    app_mut(&mut white).undo(); // no take-backs online
+    assert_eq!(app(&white).game.ply_count(), 6);
+    click_square(&mut white, "h5");
+    click_square(&mut white, "f7");
+    wait_both(&mut white, &mut black, "mate to arrive", |_, b| b.game.result().is_some());
+    let mate = Some(GameResult::Checkmate { winner: Color::White });
+    assert_eq!(app(&white).game.result(), mate);
+    assert_eq!(app(&black).game.result(), mate);
+    assert_eq!(app(&black).game.san_moves(), ["e4", "e5", "Bc4", "Nc6", "Qh5", "Nf6", "Qxf7#"]);
+    for _ in 0..4 {
+        black.step();
+    }
+    black.render().unwrap().save(shots_dir().join("07-online-mate-black.png")).unwrap();
+
+    // Leaving tells the other player.
+    click_button(&mut white, "Leave");
+    assert_eq!(app(&white).online_state, OnlineState::Idle);
+    wait_both(&mut white, &mut black, "leave to arrive", |_, b| matches!(b.online_state, OnlineState::Ended(_)));
+    assert_eq!(app(&black).online_state, OnlineState::Ended("Your opponent left the game.".into()));
+}
+
+#[test]
+fn online_draw_offers() {
+    let (mut host, mut guest) = online_pair(SidePick::Black, false);
+    assert_eq!(app(&guest).human, Color::White);
+    drag_piece(&mut guest, "d2", "d4");
+    wait_both(&mut host, &mut guest, "d4", |h, _| h.game.ply_count() == 1);
+
+    // Declined offer.
+    click_button(&mut guest, "Offer draw");
+    assert!(app(&guest).i_offered_draw);
+    wait_both(&mut host, &mut guest, "offer", |h, _| h.draw_offered_to_me);
+    click_button(&mut host, "Decline");
+    wait_both(&mut host, &mut guest, "decline", |_, g| !g.i_offered_draw);
+    assert_eq!(app(&guest).game.result(), None);
+
+    // Accepted offer ends both games as a draw.
+    click_button(&mut host, "Offer draw");
+    wait_both(&mut host, &mut guest, "offer", |_, g| g.draw_offered_to_me);
+    click_button(&mut guest, "Accept draw");
+    wait_both(&mut host, &mut guest, "accept", |h, _| h.game.result().is_some());
+    assert_eq!(app(&host).game.result(), Some(GameResult::Agreement));
+    assert_eq!(app(&guest).game.result(), Some(GameResult::Agreement));
+}
+
+#[test]
+fn online_resignation_and_saved_pgn() {
+    let dir = temp_games_dir("online");
+    let network = Network::local();
+    let online = AppConfig { mode: Mode::Online, network, games_dir: Some(dir.clone()), ..cfg() };
+    let mut host = harness(AppConfig { side: SidePick::White, ..online.clone() });
+    let mut guest = harness(AppConfig { games_dir: None, ..online });
+    click_button(&mut host, "Host game");
+    app_mut(&mut guest).online_code_input = app(&host).online_code().unwrap();
+    click_button(&mut guest, "Join");
+    wait_both(&mut host, &mut guest, "connected", |h, g| {
+        h.online_state == OnlineState::Playing && g.online_state == OnlineState::Playing
+    });
+    drag_piece(&mut host, "g1", "f3");
+    wait_both(&mut host, &mut guest, "Nf3", |_, g| g.game.ply_count() == 1);
+    click_button(&mut guest, "Resign");
+    let won = Some(GameResult::Resignation { winner: Color::White });
+    assert_eq!(app(&guest).game.result(), won);
+    wait_both(&mut host, &mut guest, "resignation", |h, _| h.game.result().is_some());
+    assert_eq!(app(&host).game.result(), won);
+    let pgn = std::fs::read_to_string(app(&host).record.clone().unwrap()).unwrap();
+    for tag in ["[Event \"chess-rs online game\"]", "[White \"You\"]", "[Black \"Opponent\"]", "[Mode \"Online\"]"] {
+        assert!(pgn.contains(tag), "missing {tag} in\n{pgn}");
+    }
+    assert!(!pgn.contains("BotDepth"));
+    assert!(pgn.contains("1. Nf3 1-0"), "{pgn}");
+}
+
+#[test]
+fn online_cancel_hosting_and_switching_modes() {
+    let mut h = harness(AppConfig { mode: Mode::Online, ..cfg() });
+    click_button(&mut h, "Host game");
+    assert!(app(&h).online_active());
+    click_button(&mut h, "Cancel");
+    assert!(!app(&h).online_active());
+    assert_eq!(app(&h).online_state, OnlineState::Idle);
+    // Leaving Online mode while hosting stops hosting.
+    click_button(&mut h, "Host game");
+    app_mut(&mut h).set_mode(Mode::HumanVsBot);
+    assert!(!app(&h).online_active());
+    click_square(&mut h, "e2");
+    click_square(&mut h, "e4");
+    wait(&mut h, "bot reply", |a| a.game.ply_count() == 2);
+}
+
+#[test]
+fn moves_slide_into_place_but_dropped_pieces_just_land() {
+    let mut h = harness(AppConfig { mode: Mode::HumanVsHuman, ..cfg() });
+    click_square(&mut h, "e2");
+    click_square(&mut h, "e4");
+    assert!(app(&h).board.is_animating(), "a clicked move slides");
+    for _ in 0..60 {
+        h.step();
+    }
+    assert!(!app(&h).board.is_animating(), "and stops");
+    drag_piece(&mut h, "e7", "e5");
+    assert!(!app(&h).board.is_animating(), "a dropped piece is already in place");
+    // Castling slides both king and rook; turning animation off stops it.
+    play_san(&mut h, &["Nf3", "Nc6", "Bc4", "Bc5"]);
+    play_san(&mut h, &["O-O"]);
+    assert!(app(&h).board.is_animating());
+    assert_eq!(app(&h).board.sliding_pieces(), 2, "king and rook");
+    app_mut(&mut h).board.animate = false;
+    play_san(&mut h, &["Nf6"]);
+    assert!(!app(&h).board.is_animating());
+}
+
+#[test]
+fn bot_vs_bot_games_open_differently() {
+    let mut h = harness(AppConfig { mode: Mode::BotVsBot, depth: 1, ..cfg() });
+    let mut openings = std::collections::HashSet::new();
+    for _ in 0..6 {
+        wait(&mut h, "four book moves", |a| a.game.ply_count() >= 4);
+        assert!(app(&h).last_from_book, "the opening comes from the book");
+        openings.insert(app(&h).game.san_moves()[..4].to_vec());
+        app_mut(&mut h).new_game();
+    }
+    assert!(openings.len() >= 2, "every game opened the same: {openings:?}");
+}
+
+#[test]
+fn every_mode_is_a_visible_button() {
+    let mut h = harness(cfg());
+    for m in Mode::ALL {
+        click_button(&mut h, m.label());
+        assert_eq!(app(&h).mode, m);
+    }
+    assert!(app(&h).status_text().contains("host a game"));
 }

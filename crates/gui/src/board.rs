@@ -1,7 +1,7 @@
 //! The chess board widget: painting, click-to-move and drag-and-drop.
 
-use chess_engine::types::{bb, file_of, make_sq, rank_of};
-use chess_engine::{Color, Move, PieceType, Position, Square};
+use chess_engine::types::{file_of, make_sq, rank_of};
+use chess_engine::{Move, Piece, PieceType, Position, Square};
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 
 use crate::pieces::PieceImages;
@@ -13,6 +13,15 @@ const SELECTED: Color32 = Color32::from_rgba_unmultiplied_const(20, 90, 40, 120)
 const HOVER: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 50);
 const MARKER: Color32 = Color32::from_rgba_unmultiplied_const(15, 35, 15, 70);
 const HINT: Color32 = Color32::from_rgba_unmultiplied_const(30, 110, 200, 200);
+/// How long a piece takes to slide to its new square.
+pub const ANIMATION_SECS: f64 = 0.18;
+
+/// Pieces sliding from one square to another (a move; castling moves two).
+#[derive(Clone, Debug)]
+struct Slide {
+    pieces: Vec<(Piece, Square, Square)>,
+    start: f64,
+}
 
 /// Interaction state that persists between frames.
 #[derive(Debug)]
@@ -24,11 +33,28 @@ pub struct BoardState {
     pub flipped: bool,
     /// Screen rect of the board in the last frame (used by tests and overlays).
     pub rect: Rect,
+    /// Slide pieces to their new squares when a move is played.
+    pub animate: bool,
+    /// The position drawn last frame, to notice when a move was played.
+    shown: Option<Position>,
+    slide: Option<Slide>,
+    /// The user just dropped this move: the piece is already in place.
+    dropped: Option<(Square, Square)>,
 }
 
 impl Default for BoardState {
     fn default() -> Self {
-        BoardState { selected: None, dragging: None, drag_pos: None, flipped: false, rect: Rect::NOTHING }
+        BoardState {
+            selected: None,
+            dragging: None,
+            drag_pos: None,
+            flipped: false,
+            rect: Rect::NOTHING,
+            animate: true,
+            shown: None,
+            slide: None,
+            dropped: None,
+        }
     }
 }
 
@@ -54,6 +80,41 @@ impl BoardState {
         let row = (((p.y - self.rect.min.y) / s) as u8).min(7);
         Some(if self.flipped { make_sq(7 - col, row) } else { make_sq(col, 7 - row) })
     }
+
+    /// A piece is mid-slide.
+    pub fn is_animating(&self) -> bool {
+        self.slide.is_some()
+    }
+
+    /// How many pieces are sliding right now.
+    pub fn sliding_pieces(&self) -> usize {
+        self.slide.as_ref().map_or(0, |s| s.pieces.len())
+    }
+
+    /// Start a slide if `pos` is the last-drawn position plus `last_move`.
+    fn notice_move(&mut self, pos: &Position, last_move: Option<Move>, now: f64) {
+        let prev = self.shown.replace(*pos);
+        let dropped = self.dropped.take();
+        if prev.is_none_or(|p| p.hash() == pos.hash()) {
+            return;
+        }
+        self.slide = None;
+        let (Some(prev), Some(m)) = (prev, last_move) else { return };
+        let follows = chess_engine::legal_moves(&prev).contains(&m) && prev.make_move(m).hash() == pos.hash();
+        if !self.animate || !follows || dropped == Some((m.from(), m.to())) {
+            return;
+        }
+        let Some(piece) = pos.piece_on(m.to()) else { return };
+        let mut pieces = vec![(piece, m.from(), m.to())];
+        if m.is_castle() {
+            let rank = rank_of(m.from());
+            let (from, to) = if file_of(m.to()) > file_of(m.from()) { (7, 5) } else { (0, 3) };
+            if let Some(rook) = pos.piece_on(make_sq(to, rank)) {
+                pieces.push((rook, make_sq(from, rank), make_sq(to, rank)));
+            }
+        }
+        self.slide = Some(Slide { pieces, start: now });
+    }
 }
 
 pub struct BoardView<'a> {
@@ -74,6 +135,16 @@ pub struct BoardView<'a> {
 pub fn board_ui(ui: &mut Ui, state: &mut BoardState, view: &BoardView, size: f32) -> Option<(Square, Square)> {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
     state.rect = rect;
+    let now = ui.input(|i| i.time);
+    state.notice_move(view.pos, view.last_move, now);
+    // Fraction of the slide done (None = nothing moving).
+    let slide = state.slide.clone().and_then(|sl| {
+        let t = ((now - sl.start) / ANIMATION_SECS) as f32;
+        if t >= 1.0 { None } else { Some((sl, egui::emath::easing::cubic_out(t.max(0.0)))) }
+    });
+    if slide.is_none() {
+        state.slide = None;
+    }
     let s = state.square_size();
     let painter = ui.painter_at(rect.expand(2.0));
     let pos = view.pos;
@@ -115,6 +186,7 @@ pub fn board_ui(ui: &mut Ui, state: &mut BoardState, view: &BoardView, size: f32
             {
                 if is_target(from, to) {
                     result = Some((from, to));
+                    state.dropped = Some((from, to));
                     state.selected = None;
                 } else if has_moves(to) {
                     state.selected = Some(to);
@@ -209,12 +281,20 @@ pub fn board_ui(ui: &mut Ui, state: &mut BoardState, view: &BoardView, size: f32
     }
 
     // ---- pieces ----
+    let sliding_to = |sq: Square| slide.as_ref().is_some_and(|(sl, _)| sl.pieces.iter().any(|&(_, _, to)| to == sq));
     for sq in 0..64u8 {
         let Some(p) = pos.piece_on(sq) else { continue };
-        if Some(sq) == state.dragging {
+        if Some(sq) == state.dragging || sliding_to(sq) {
             continue;
         }
         view.images.get(p).paint_at(ui, state.square_rect(sq));
+    }
+    if let Some((sl, t)) = &slide {
+        for &(piece, from, to) in &sl.pieces {
+            let (a, b) = (state.square_rect(from), state.square_rect(to));
+            view.images.get(piece).paint_at(ui, a.translate((b.min - a.min) * *t));
+        }
+        ui.ctx().request_repaint();
     }
 
     // ---- hint and review arrows ----
@@ -298,9 +378,4 @@ pub fn is_promotion(legal: &[Move], from: Square, to: Square) -> bool {
 
 pub fn find_move(legal: &[Move], from: Square, to: Square, promo: Option<PieceType>) -> Option<Move> {
     legal.iter().copied().find(|m| m.from() == from && m.to() == to && m.promotion() == promo)
-}
-
-/// Color of the piece on `sq`, if any.
-pub fn color_on(pos: &Position, sq: Square) -> Option<Color> {
-    (pos.occupied() & bb(sq) != 0).then(|| pos.piece_on(sq).map(|p| p.color())).flatten()
 }

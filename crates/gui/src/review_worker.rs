@@ -74,10 +74,6 @@ impl ReviewHandle {
     pub fn try_recv(&self) -> Option<ReviewEvent> {
         self.rx.try_recv().ok()
     }
-
-    pub fn recv_timeout(&self, d: std::time::Duration) -> Option<ReviewEvent> {
-        self.rx.recv_timeout(d).ok()
-    }
 }
 
 impl Drop for ReviewHandle {
